@@ -1,0 +1,15 @@
+{
+  "name": "ComfyUI-ACES-EXR-Toolkit",
+  "version": "0.1.0",
+  "description": "ACES Studio 1.3 and OpenEXR workflow nodes for ComfyUI.",
+  "author": "azhagurajpandians",
+  "license": "MIT",
+  "tags": [
+    "aces",
+    "ocio",
+    "opencolorio",
+    "exr",
+    "hdr",
+    "color-management"
+  ]
+}
