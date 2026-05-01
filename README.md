@@ -141,24 +141,20 @@ Recommended transform:
 - `target`: `sRGB`
 - `clamp_output`: `true`
 
-### Save EXR (Round-tripping back to ACES)
-
-If you loaded an `ACES2065-1` image and converted it to `sRGB` to process/edit it in ComfyUI, you must convert it **back** to `ACES2065-1` before saving. Otherwise, the saved EXR will contain raw sRGB values, which will look extremely distorted (e.g., cyan/yellow) if you later load it and apply an ACES transform again.
-
-You can do this directly inside the `Save EXR` node without needing an extra node:
-
-```text
-... sRGB image pipeline ... -> Save EXR
-```
-
-In the `Save EXR` node, configure the built-in transform:
-- `ocio_config`: `ocio://studio-config-v1.0.0_aces-v1.3_ocio-v2.1`
-- `input_transform`: `sRGB` (or `Utility - sRGB - Texture`)
-- `colorspace`: `ACES - ACES2065-1`
-
 This will automatically reverse the color space before writing the final `.exr` file.
 
 The output is written to your selected output directory or ComfyUI's `output` folder as a 16-bit or 32-bit float EXR.
+
+### Verified Round-trip Workflow
+
+For professional VFX work, you often need to go `ACES -> sRGB -> ACES`. This toolkit provides a dedicated **reverse** toggle to make this setup easy and accurate.
+
+![ACES Round-trip Workflow](assets/roundtrip_workflow.png)
+
+**Key settings for a perfect round-trip:**
+1. **Node 2 (Forward):** `source: ACES2065-1`, `target: sRGB`, `clamp_output: false`.
+2. **Node 3 (Backward):** `source: ACES2065-1`, `target: sRGB`, **`reverse: true`**, `clamp_output: false`.
+3. **IMPORTANT:** Always set `clamp_output` to **false** on intermediate nodes to preserve high-dynamic-range data for the reverse transform.
 
 ## Troubleshooting
 
