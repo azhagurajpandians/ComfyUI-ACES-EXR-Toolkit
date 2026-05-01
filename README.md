@@ -141,13 +141,24 @@ Recommended transform:
 - `target`: `sRGB`
 - `clamp_output`: `true`
 
-### Save EXR
+### Save EXR (Round-tripping back to ACES)
+
+If you loaded an `ACES2065-1` image and converted it to `sRGB` to process/edit it in ComfyUI, you must convert it **back** to `ACES2065-1` before saving. Otherwise, the saved EXR will contain raw sRGB values, which will look extremely distorted (e.g., cyan/yellow) if you later load it and apply an ACES transform again.
+
+You can do this directly inside the `Save EXR` node without needing an extra node:
 
 ```text
-... image pipeline ... -> Save EXR
+... sRGB image pipeline ... -> Save EXR
 ```
 
-The output is written to ComfyUI's `output` folder as float EXR.
+In the `Save EXR` node, configure the built-in transform:
+- `ocio_config`: `ocio://studio-config-v1.0.0_aces-v1.3_ocio-v2.1`
+- `input_transform`: `sRGB` (or `Utility - sRGB - Texture`)
+- `colorspace`: `ACES - ACES2065-1`
+
+This will automatically reverse the color space before writing the final `.exr` file.
+
+The output is written to your selected output directory or ComfyUI's `output` folder as a 16-bit or 32-bit float EXR.
 
 ## Troubleshooting
 

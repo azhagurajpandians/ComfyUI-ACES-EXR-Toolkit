@@ -640,7 +640,7 @@ class ACESSaveEXR:
             },
             "optional": {
                 "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
-                "ocio_config": ("STRING", {"default": "", "multiline": False}),
+                "ocio_config": ("STRING", {"default": DEFAULT_OCIO_CONFIG, "multiline": False}),
                 "input_transform": (OCIO_SPACES, {"default": "ACEScg"}),
                 "colorspace": (OCIO_SPACES, {"default": "ACES2065-1"}),
             }
@@ -653,7 +653,7 @@ class ACESSaveEXR:
     CATEGORY = CATEGORY
 
     def save(self, image, output_dir, filename, bit_depth, compression,
-             start_frame=1, ocio_config="", input_transform="ACEScg", colorspace="ACES2065-1"):
+             start_frame=1, ocio_config=DEFAULT_OCIO_CONFIG, input_transform="ACEScg", colorspace="ACES2065-1"):
         import re
         arr = _tensor_to_numpy(image).copy()
         

@@ -1,1 +1,2 @@
 opencolorio>=2.2.0
+openexr>=3.2.0
