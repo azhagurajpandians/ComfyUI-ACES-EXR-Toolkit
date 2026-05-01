@@ -6,13 +6,13 @@ This extension adds practical OpenEXR loading/saving, ACES Studio 1.3 OCIO color
 
 ## Features
 
-- Load RGBA/RGB OpenEXR files as ComfyUI `IMAGE` and `MASK`
-- Load EXRs from ComfyUI `input` or from an absolute file path
-- Preview transparent EXRs with checker, black, gray, or white alpha compositing
-- Convert with ACES Studio 1.3 through OpenColorIO
-- Fallback built-in matrix transforms for common spaces
-- Save float RGB images back to `.exr`
-- Tone map HDR images for display previews
+- **Fast OCIO Processing**: Native bulk-pixel processing via PyOpenColorIO for lightning-fast ACES transformations.
+- **Load EXR Sequences**: Auto-detects and loads numbered EXR sequences (`render.0001.exr`) directly into ComfyUI batch tensors.
+- **16-bit & 32-bit Export**: Save half-float (16f) or float (32f) EXRs with standard compression codecs (ZIP, PIZ, DWAA) via `OpenEXR`.
+- **Integrated UI Browser**: Visual file browser modal to easily pick absolute paths and output directories without copy-pasting.
+- **Alpha Previews**: Preview transparent EXRs with checker, black, gray, or white alpha compositing.
+- **Built-in Fallbacks**: Basic ACEScg / sRGB transforms work even if OCIO isn't installed.
+- **Tone Mapping**: Apply simple display tone mapping for HDR previews.
 
 ## Nodes
 
@@ -57,9 +57,11 @@ Required runtime packages are normally already included with ComfyUI:
 
 Recommended for ACES Studio 1.3:
 
-- `opencolorio`
+- `opencolorio` (The pip package is named `opencolorio`; the Python module it provides is `PyOpenColorIO`.)
 
-The pip package is named `opencolorio`; the Python module it provides is `PyOpenColorIO`.
+Recommended for 16-bit Float and Compression export:
+
+- `openexr`
 
 ## ACES Studio 1.3
 

@@ -22,6 +22,19 @@ OCIO_SPACE_ALIASES = {
     "ACES2065-1": ["ACES2065-1", "ACES - ACES2065-1"],
 }
 
+COMPRESSIONS = {
+    "ZIP  (lossless, recommended)":  "ZIP_COMPRESSION",
+    "ZIPS (lossless, scanline)":     "ZIPS_COMPRESSION",
+    "PIZ  (lossless, wavelet)":      "PIZ_COMPRESSION",
+    "PXR24 (lossy, 24-bit)":         "PXR24_COMPRESSION",
+    "RLE  (lossless, run-length)":   "RLE_COMPRESSION",
+    "B44  (lossy, fixed ratio)":     "B44_COMPRESSION",
+    "DWAA (lossy, DCT, fast)":       "DWAA_COMPRESSION",
+    "None (uncompressed)":           "NO_COMPRESSION",
+}
+COMPRESSION_KEYS = list(COMPRESSIONS.keys())
+BIT_DEPTHS = ["16f (half-float)", "32f (float)"]
+
 OCIO_SPACES = [
     "sRGB",
     "Linear sRGB",
@@ -115,28 +128,25 @@ def _resolve_input_path(filename: str, exr_path: str = "") -> Path:
 
 def _image_to_tensor(image: np.ndarray, alpha_mode: str):
     image = np.asarray(image, dtype=np.float32)
-    while image.ndim > 3:
-        squeeze_axes = [axis for axis in range(image.ndim - 1) if image.shape[axis] == 1]
-        if squeeze_axes:
-            image = np.squeeze(image, axis=tuple(squeeze_axes))
-        else:
-            image = image[0]
+    # Ensure shape is [B, H, W, C]
     if image.ndim == 2:
-        image = image[:, :, None]
-    if image.ndim != 3:
-        raise ValueError(f"Expected EXR image data with 2 or 3 dimensions after normalization, got shape {image.shape}")
+        image = image[None, :, :, None]
+    elif image.ndim == 3:
+        image = image[None, ...]
+        
     if image.shape[-1] == 1:
         image = np.repeat(image, 3, axis=-1)
 
+    B, H, W, C = image.shape
     alpha = None
-    if image.shape[-1] >= 4:
-        alpha = np.clip(image[:, :, 3].copy(), 0.0, 1.0)
-        rgb = image[:, :, :3].copy()
+    if C >= 4:
+        alpha = np.clip(image[..., 3].copy(), 0.0, 1.0)
+        rgb = image[..., :3].copy()
         if alpha_mode == "unpremultiply":
-            denom = np.maximum(alpha[:, :, None], 1.0e-6)
-            rgb = np.where(alpha[:, :, None] > 1.0e-6, rgb / denom, rgb)
+            denom = np.maximum(alpha[..., None], 1.0e-6)
+            rgb = np.where(alpha[..., None] > 1.0e-6, rgb / denom, rgb)
         elif alpha_mode == "premultiply":
-            rgb = rgb * alpha[:, :, None]
+            rgb = rgb * alpha[..., None]
         elif alpha_mode.startswith("composite"):
             if alpha_mode == "composite black":
                 background = np.zeros_like(rgb)
@@ -145,22 +155,23 @@ def _image_to_tensor(image: np.ndarray, alpha_mode: str):
             elif alpha_mode == "composite gray":
                 background = np.full_like(rgb, 0.5)
             else:
-                yy, xx = np.indices(alpha.shape)
+                yy, xx = np.indices((H, W))
                 checker = (((xx // 64) + (yy // 64)) % 2).astype(np.float32)
                 checker = checker * 0.35 + 0.35
-                background = np.repeat(checker[:, :, None], 3, axis=2)
-            rgb = rgb * alpha[:, :, None] + background * (1.0 - alpha[:, :, None])
+                background = np.repeat(checker[None, :, :, None], 3, axis=3)
+                background = np.repeat(background, B, axis=0)
+            rgb = rgb * alpha[..., None] + background * (1.0 - alpha[..., None])
     else:
-        rgb = image[:, :, :3].copy()
+        rgb = image[..., :3].copy()
 
-    mask = np.zeros(rgb.shape[:2], dtype=np.float32) if alpha is None else 1.0 - np.clip(alpha, 0.0, 1.0)
-    return torch.from_numpy(rgb)[None,], torch.from_numpy(mask)[None,]
+    mask = np.zeros((B, H, W), dtype=np.float32) if alpha is None else 1.0 - np.clip(alpha, 0.0, 1.0)
+    return torch.from_numpy(rgb), torch.from_numpy(mask)
 
 
 def _tensor_to_numpy(image: torch.Tensor) -> np.ndarray:
     arr = image.detach().cpu().numpy()
-    if arr.ndim == 4:
-        arr = arr[0]
+    if arr.ndim == 3:
+        arr = arr[None, ...]
     return np.asarray(arr, dtype=np.float32)
 
 
@@ -180,21 +191,151 @@ def _read_exr(path: Path) -> np.ndarray:
         errors.append(f"opencv: {exc}")
 
     try:
-        import imageio.v3 as iio
-
-        return iio.imread(path)
+        import imageio.v2 as iio
+        import imageio
+        try:
+            imageio.plugins.freeimage.download()
+        except Exception:
+            pass
+        return iio.imread(path, format="EXR-FI")
     except Exception as exc:
-        errors.append(f"imageio: {exc}")
+        errors.append(f"imageio(freeimage): {exc}")
+
+    try:
+        import imageio.v3 as iio
+        img = iio.imread(path)
+        if img.dtype == np.uint8:
+            print("Warning: ComfyUI-ACES-EXR read EXR as 8-bit, values normalized and precision lost.")
+            img = img.astype(np.float32) / 255.0
+        return img
+    except Exception as exc:
+        errors.append(f"imageio(v3): {exc}")
 
     raise RuntimeError(
         "Could not read EXR. Install an EXR-capable backend such as OpenImageIO, "
         "or enable OpenEXR support for imageio/opencv. Backend errors: " + " | ".join(errors)
     )
 
+def _detect_exr_sequence(path_str):
+    import re
+    path = Path(path_str)
+    if not path.is_file():
+        return [], 0, 0
+    
+    match = re.search(r'([._-]?)(0*\d+)(\.exr)$', path.name, re.IGNORECASE)
+    if not match:
+        return [path], 1, 1
+        
+    prefix = path.name[:match.start(2)]
+    suffix = path.name[match.end(2):]
+    
+    dir_path = path.parent
+    seq_files = []
+    
+    for f in dir_path.glob(f"*{suffix}"):
+        if f.name.startswith(prefix) and f.name.endswith(suffix):
+            num_str = f.name[len(prefix):-len(suffix)]
+            if num_str.isdigit():
+                seq_files.append((int(num_str), f))
+                
+    if not seq_files:
+        return [path], 1, 1
+        
+    seq_files.sort(key=lambda x: x[0])
+    paths = [f[1] for f in seq_files]
+    return paths, seq_files[0][0], seq_files[-1][0]
 
-def _write_exr(path: Path, image: np.ndarray):
+def _load_exr_sequence(path_str, frame_mode, start_frame, end_frame, missing_policy):
+    paths, seq_first, seq_last = _detect_exr_sequence(path_str)
+    if not paths:
+        raise FileNotFoundError(f"No sequence found at: {path_str}")
+        
+    import re
+    def get_num(p):
+        m = re.search(r'([._-]?)(0*\d+)(\.exr)$', p.name, re.IGNORECASE)
+        return int(m.group(2)) if m else 0
+        
+    path_map = {get_num(p): p for p in paths}
+    
+    if frame_mode == "single":
+        f_start = f_end = start_frame
+    elif frame_mode == "range":
+        f_start, f_end = start_frame, end_frame
+    else: # all
+        f_start, f_end = seq_first, seq_last
+        
+    frames = []
+    last_good = None
+    for f in range(f_start, f_end + 1):
+        if f in path_map:
+            img = _read_exr(path_map[f])
+            frames.append(img)
+            last_good = img
+        else:
+            if missing_policy == "error":
+                raise FileNotFoundError(f"Missing frame {f} in sequence.")
+            elif missing_policy == "black":
+                if last_good is not None:
+                    frames.append(np.zeros_like(last_good))
+                else:
+                    frames.append(None) # resolve later
+            elif missing_policy == "hold":
+                if last_good is not None:
+                    frames.append(last_good)
+                else:
+                    frames.append(None) # resolve later
+                    
+    # resolve missing leading frames
+    first_good = next((x for x in frames if x is not None), None)
+    if first_good is None:
+        raise RuntimeError("Entire sequence is missing or invalid.")
+    
+    for i in range(len(frames)):
+        if frames[i] is None:
+            frames[i] = np.zeros_like(first_good) if missing_policy == "black" else first_good
+            
+    seq_arr = np.stack(frames, axis=0) # [B, H, W, C]
+    return seq_arr, len(frames), f_start, f_end
+
+
+def _write_exr_openexr(img: np.ndarray, path: str, use_half: bool, compression_key: str):
+    import OpenEXR
+    import Imath
+    
+    comp_name = COMPRESSIONS.get(compression_key, "ZIP_COMPRESSION")
+    imath_comp = getattr(Imath.Compression, comp_name)
+    ptype_write = Imath.PixelType(Imath.PixelType.HALF if use_half else Imath.PixelType.FLOAT)
+    dtype_write = np.float16 if use_half else np.float32
+
+    H, W, C = img.shape
+    channel_names = ["R", "G", "B", "A"] if C == 4 else ["R", "G", "B"]
+
+    header = OpenEXR.Header(W, H)
+    header["compression"] = Imath.Compression(imath_comp)
+    header["channels"] = {ch: Imath.Channel(ptype_write) for ch in channel_names}
+
+    out = OpenEXR.OutputFile(path, header)
+    pixels = {}
+    for i, ch in enumerate(channel_names):
+        pixels[ch] = img[:, :, i].astype(dtype_write).tobytes()
+    out.writePixels(pixels)
+    out.close()
+
+
+def _write_exr(path: Path, image: np.ndarray, bit_depth: str = "32f (float)", compression: str = "None (uncompressed)"):
     errors = []
     path.parent.mkdir(parents=True, exist_ok=True)
+    
+    use_half = "16f" in bit_depth
+    
+    try:
+        _write_exr_openexr(image, str(path), use_half, compression)
+        return
+    except ImportError:
+        errors.append("OpenEXR python module not installed (pip install openexr)")
+    except Exception as exc:
+        errors.append(f"OpenEXR: {exc}")
+
     try:
         import cv2
 
@@ -248,6 +389,29 @@ def _ocio_names(name: str):
 
 def _ocio_processor(config, source: str, target: str):
     errors = []
+
+    if target == "sRGB" or target in OCIO_SPACE_ALIASES.get("sRGB", []):
+        try:
+            import PyOpenColorIO as ocio
+            displays = list(config.getDisplays())
+            if "sRGB - Display" in displays:
+                for src in _ocio_names(source):
+                    try:
+                        config.getColorSpace(src)
+                        transform = ocio.DisplayViewTransform()
+                        transform.setSrc(src)
+                        transform.setDisplay("sRGB - Display")
+                        views = list(config.getViews("sRGB - Display"))
+                        if "ACES 1.0 - SDR Video" in views:
+                            transform.setView("ACES 1.0 - SDR Video")
+                        else:
+                            transform.setView(views[0])
+                        return config.getProcessor(transform)
+                    except Exception as exc:
+                        errors.append(f"DisplayViewTransform({src}): {exc}")
+        except Exception as exc:
+            errors.append(f"Display configuration failed: {exc}")
+
     for src in _ocio_names(source):
         for dst in _ocio_names(target):
             try:
@@ -258,17 +422,20 @@ def _ocio_processor(config, source: str, target: str):
 
 
 def _apply_ocio(arr: np.ndarray, config_path: str, source: str, target: str) -> np.ndarray:
+    try:
+        import PyOpenColorIO as ocio
+    except ImportError:
+        pass
+        
     config = _ocio_config(config_path)
     cpu = _ocio_processor(config, source, target).getDefaultCPUProcessor()
-    out = arr.copy()
-    flat = out.reshape(-1, out.shape[-1])
-    for pixel in flat[:, :3]:
-        rgb = [float(pixel[0]), float(pixel[1]), float(pixel[2])]
-        result = cpu.applyRGB(rgb)
-        if result is None:
-            pixel[:] = rgb
-        else:
-            pixel[:] = result
+    out = np.ascontiguousarray(arr.copy(), dtype=np.float32)
+    B, H, W, C = out.shape
+    for b in range(B):
+        frame = np.ascontiguousarray(out[b], dtype=np.float32)
+        desc = ocio.PackedImageDesc(frame, W, H, C)
+        cpu.apply(desc)
+        out[b] = frame
     return out
 
 
@@ -322,27 +489,32 @@ class ACESLoadEXR:
         return {
             "required": {
                 "exr_file": (_list_input_exrs(), {"image_upload": True}),
-                "exr_path": ("STRING", {"default": "", "multiline": False}),
                 "alpha_mode": (["composite checker", "ignore", "unpremultiply", "premultiply", "composite black", "composite gray", "composite white"],),
                 "clamp_negative": (["false", "true"],),
+                "frame_mode": (["all", "single", "range"], {"default": "all"}),
+                "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
+                "end_frame": ("INT", {"default": 100, "min": 0, "max": 99999}),
+                "missing_frames": (["error", "black", "hold"], {"default": "error"}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
-    RETURN_NAMES = ("image", "mask", "path")
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("image", "mask", "frame_count", "first_frame", "last_frame", "path")
     FUNCTION = "load"
     CATEGORY = CATEGORY
 
-    def load(self, exr_file, exr_path, alpha_mode, clamp_negative):
-        path = _resolve_input_path(exr_file, exr_path)
+    def load(self, exr_file, alpha_mode, clamp_negative, frame_mode, start_frame, end_frame, missing_frames):
+        path = _resolve_input_path(exr_file, "")
         if not path.exists():
             raise FileNotFoundError(f"EXR file not found: {path}")
-        image = _read_exr(path)
+            
+        seq_arr, count, f_start, f_end = _load_exr_sequence(str(path), frame_mode, start_frame, end_frame, missing_frames)
+        
         if clamp_negative == "true":
-            image = np.maximum(image, 0.0)
-        tensor, mask = _image_to_tensor(image, alpha_mode)
-        return (tensor, mask, str(path))
-
+            seq_arr = np.maximum(seq_arr, 0.0)
+            
+        tensor, mask = _image_to_tensor(seq_arr, alpha_mode)
+        return (tensor, mask, count, f_start, f_end, str(path))
 
 class ACESLoadEXRFromPath:
     @classmethod
@@ -352,23 +524,33 @@ class ACESLoadEXRFromPath:
                 "exr_path": ("STRING", {"default": "", "multiline": False}),
                 "alpha_mode": (["composite checker", "ignore", "unpremultiply", "premultiply", "composite black", "composite gray", "composite white"],),
                 "clamp_negative": (["false", "true"],),
+                "frame_mode": (["all", "single", "range"], {"default": "all"}),
+                "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
+                "end_frame": ("INT", {"default": 100, "min": 0, "max": 99999}),
+                "missing_frames": (["error", "black", "hold"], {"default": "error"}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
-    RETURN_NAMES = ("image", "mask", "path")
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("image", "mask", "frame_count", "first_frame", "last_frame", "path")
     FUNCTION = "load"
     CATEGORY = CATEGORY
 
-    def load(self, exr_path, alpha_mode, clamp_negative):
-        path = _resolve_input_path("", exr_path)
+    def load(self, exr_path, alpha_mode, clamp_negative, frame_mode, start_frame, end_frame, missing_frames):
+        path = Path(exr_path.strip())
         if not path.exists():
             raise FileNotFoundError(f"EXR file not found: {path}")
-        image = _read_exr(path)
+            
+        seq_arr, count, f_start, f_end = _load_exr_sequence(str(path), frame_mode, start_frame, end_frame, missing_frames)
+        
         if clamp_negative == "true":
-            image = np.maximum(image, 0.0)
-        tensor, mask = _image_to_tensor(image, alpha_mode)
-        return (tensor, mask, str(path))
+            seq_arr = np.maximum(seq_arr, 0.0)
+            
+        tensor, mask = _image_to_tensor(seq_arr, alpha_mode)
+        return (tensor, mask, count, f_start, f_end, str(path))
+
+
+
 
 
 class ACESTransform:
@@ -399,7 +581,7 @@ class ACESTransform:
             if target not in ("sRGB", "Linear sRGB", "ACEScg", "ACES2065-1"):
                 raise ValueError("Built-in matrices only support sRGB, Linear sRGB, ACEScg, and ACES2065-1.")
             if source == "sRGB":
-                arr[:, :, :3] = _srgb_decode(arr[:, :, :3])
+                arr[..., :3] = _srgb_decode(arr[..., :3])
                 source = "Linear sRGB"
             encode_srgb = target == "sRGB"
             if encode_srgb:
@@ -408,10 +590,10 @@ class ACESTransform:
             if matrix is not None:
                 arr = _apply_matrix(arr, matrix)
             if encode_srgb:
-                arr[:, :, :3] = _srgb_encode(arr[:, :, :3])
+                arr[..., :3] = _srgb_encode(arr[..., :3])
         if clamp_output == "true":
             arr = np.clip(arr, 0.0, 1.0)
-        return (torch.from_numpy(arr)[None,],)
+        return (torch.from_numpy(arr),)
 
 
 class ACESToneMap:
@@ -432,7 +614,7 @@ class ACESToneMap:
 
     def tonemap(self, image, exposure, look, output):
         arr = _tensor_to_numpy(image).copy()
-        rgb = np.maximum(arr[:, :, :3] * (2.0 ** exposure), 0.0)
+        rgb = np.maximum(arr[..., :3] * (2.0 ** exposure), 0.0)
         if look == "ACES fitted":
             a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
             rgb = (rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e)
@@ -441,8 +623,8 @@ class ACESToneMap:
         rgb = np.clip(rgb, 0.0, 1.0)
         if output == "sRGB":
             rgb = _srgb_encode(rgb)
-        arr[:, :, :3] = rgb
-        return (torch.from_numpy(arr)[None,],)
+        arr[..., :3] = rgb
+        return (torch.from_numpy(arr),)
 
 
 class ACESSaveEXR:
@@ -451,7 +633,16 @@ class ACESSaveEXR:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "filename_prefix": ("STRING", {"default": "aces_exr/image"}),
+                "output_dir": ("STRING", {"default": _output_dir(), "multiline": False}),
+                "filename": ("STRING", {"default": "render_%04d", "multiline": False}),
+                "bit_depth": (BIT_DEPTHS, {"default": BIT_DEPTHS[0]}),
+                "compression": (COMPRESSION_KEYS, {"default": COMPRESSION_KEYS[0]}),
+            },
+            "optional": {
+                "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
+                "ocio_config": ("STRING", {"default": "", "multiline": False}),
+                "input_transform": (OCIO_SPACES, {"default": "ACEScg"}),
+                "colorspace": (OCIO_SPACES, {"default": "ACES2065-1"}),
             }
         }
 
@@ -461,15 +652,31 @@ class ACESSaveEXR:
     OUTPUT_NODE = True
     CATEGORY = CATEGORY
 
-    def save(self, image, filename_prefix):
-        base = Path(_output_dir()) / filename_prefix
-        path = base.with_suffix(".exr")
-        index = 1
-        while path.exists():
-            path = base.with_name(f"{base.name}_{index:05d}").with_suffix(".exr")
-            index += 1
-        _write_exr(path, _tensor_to_numpy(image))
-        return (str(path),)
+    def save(self, image, output_dir, filename, bit_depth, compression,
+             start_frame=1, ocio_config="", input_transform="ACEScg", colorspace="ACES2065-1"):
+        import re
+        arr = _tensor_to_numpy(image).copy()
+        
+        if ocio_config and ocio_config.strip():
+            arr = _apply_ocio(arr, ocio_config, input_transform, colorspace)
+            
+        B = arr.shape[0]
+        last_path = ""
+        for b in range(B):
+            frame_num = start_frame + b
+            base_name = re.sub(r"%0(\d+)d", lambda m: f"{frame_num:0{m.group(1)}d}", filename)
+            if not base_name.lower().endswith(".exr"):
+                base_name += ".exr"
+            path = Path(output_dir.strip()) / base_name
+            
+            # Simple indexing fallback if no format string was used and multiple frames
+            if B > 1 and base_name == filename + ".exr":
+                path = path.with_name(f"{path.stem}_{frame_num:04d}.exr")
+            
+            _write_exr(path, arr[b], bit_depth, compression)
+            last_path = str(path)
+            
+        return {"ui": {"text": [last_path]}, "result": (last_path,)}
 
 
 NODE_CLASS_MAPPINGS = {
