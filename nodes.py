@@ -16,7 +16,7 @@ CATEGORY = "image/ACES + EXR"
 DEFAULT_OCIO_CONFIG = "ocio://studio-config-v1.0.0_aces-v1.3_ocio-v2.1"
 
 OCIO_SPACE_ALIASES = {
-    "sRGB": ["sRGB", "Utility - sRGB - Texture", "Output - sRGB"],
+    "sRGB": ["sRGB", "Output - sRGB", "Utility - sRGB - Texture"],
     "Linear sRGB": ["Linear sRGB", "Utility - Linear - sRGB"],
     "ACEScg": ["ACEScg", "ACES - ACEScg"],
     "ACES2065-1": ["ACES2065-1", "ACES - ACES2065-1"],
@@ -408,9 +408,40 @@ def _ocio_processor(config, source: str, target: str):
                             transform.setView(views[0])
                         return config.getProcessor(transform)
                     except Exception as exc:
-                        errors.append(f"DisplayViewTransform({src}): {exc}")
+                        errors.append(f"DisplayViewTransform({src} -> sRGB): {exc}")
         except Exception as exc:
-            errors.append(f"Display configuration failed: {exc}")
+            errors.append(f"Display configuration failed (target): {exc}")
+
+    # Special handling for sRGB as a SOURCE (Inverse Display View)
+    if source == "sRGB" or source in OCIO_SPACE_ALIASES.get("sRGB", []):
+        try:
+            import PyOpenColorIO as ocio
+            displays = list(config.getDisplays())
+            if "sRGB - Display" in displays:
+                for dst in _ocio_names(target):
+                    try:
+                        config.getColorSpace(dst)
+                        transform = ocio.DisplayViewTransform()
+                        transform.setSrc(dst) # Src is the Linear space we want to reach
+                        transform.setDisplay("sRGB - Display")
+                        views = list(config.getViews("sRGB - Display"))
+                        if "ACES 1.0 - SDR Video" in views:
+                            transform.setView("ACES 1.0 - SDR Video")
+                        else:
+                            transform.setView(views[0])
+                        
+                        processor = config.getProcessor(transform)
+                        # Use the inverse of the DisplayViewTransform
+                        return processor.getOptimizedProcessor(ocio.BIT_DEPTH_F32, ocio.BIT_DEPTH_F32, ocio.OPTIMIZATION_DEFAULT).getProcessor() \
+                               if hasattr(processor, "getOptimizedProcessor") else config.getProcessor(transform, ocio.TRANSFORM_DIR_INVERSE)
+                    except Exception as exc:
+                        # Fallback for older OCIO versions or specific config layouts
+                        try:
+                            return config.getProcessor(transform, ocio.TRANSFORM_DIR_INVERSE)
+                        except:
+                            errors.append(f"DisplayViewTransform(sRGB -> {dst}): {exc}")
+        except Exception as exc:
+            errors.append(f"Display configuration failed (source): {exc}")
 
     for src in _ocio_names(source):
         for dst in _ocio_names(target):
@@ -563,6 +594,7 @@ class ACESTransform:
                 "ocio_config": ("STRING", {"default": DEFAULT_OCIO_CONFIG, "multiline": False}),
                 "source": (OCIO_SPACES,),
                 "target": (OCIO_SPACES,),
+                "reverse": (["false", "true"], {"default": "false"}),
                 "clamp_output": (["false", "true"],),
             }
         }
@@ -571,8 +603,12 @@ class ACESTransform:
     FUNCTION = "transform"
     CATEGORY = CATEGORY
 
-    def transform(self, image, engine, ocio_config, source, target, clamp_output):
+    def transform(self, image, engine, ocio_config, source, target, reverse, clamp_output):
         arr = _tensor_to_numpy(image).copy()
+        
+        if reverse == "true":
+            source, target = target, source
+            
         if engine == "ACES Studio 1.3 OCIO":
             arr = _apply_ocio(arr, ocio_config, source, target)
         else:
