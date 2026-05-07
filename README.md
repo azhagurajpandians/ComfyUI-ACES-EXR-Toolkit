@@ -10,6 +10,8 @@ This extension adds practical OpenEXR loading/saving, ACES Studio 1.3 OCIO color
 - **Load EXR Sequences**: Auto-detects and loads numbered EXR sequences (`render.0001.exr`) directly into ComfyUI batch tensors.
 - **16-bit & 32-bit Export**: Save half-float (16f) or float (32f) EXRs with standard compression codecs (ZIP, PIZ, DWAA) via `OpenEXR`.
 - **Integrated UI Browser**: Visual file browser modal to easily pick absolute paths and output directories without copy-pasting.
+- **HDR WebGL Viewer**: A GPU-accelerated viewer with real-time Exposure, Gamma, False Color (ARRI-style), and Channel isolation for true 32-bit float inspection inside ComfyUI.
+- **HDR Generation Tools**: Includes Synthetic Highlight Expansion to generate HDR from SDR AI outputs, and Exposure Bracket Merging.
 - **Alpha Previews**: Preview transparent EXRs with checker, black, gray, or white alpha compositing.
 - **Built-in Fallbacks**: Basic ACEScg / sRGB transforms work even if OCIO isn't installed.
 - **Tone Mapping**: Apply simple display tone mapping for HDR previews.
@@ -23,6 +25,10 @@ This extension adds practical OpenEXR loading/saving, ACES Studio 1.3 OCIO color
 | `ACES Color Transform` | Transform between ACES, camera, sRGB, and utility color spaces |
 | `ACES Tone Map` | Apply simple display tone mapping for HDR previews |
 | `Save EXR` | Save ComfyUI image data as float EXR |
+| `Nodex HDR Viewer 🎨` | GPU-accelerated (WebGL) 32-bit float viewer with Exposure, Gamma, False Color, and sRGB toggles |
+| `Synthetic HDR Expansion 🚀` | Reconstructs a scene-linear HDR tensor from a standard display-referred (SDR) AI generation |
+| `Exposure Bracket Merge 📸` | Merges a batch of SDR images at varying EV values into a single 32-bit HDR tensor |
+| `HDR Exposure Adjust 💡` | Mathematically adjusts exposure by multiplying tensor RGB values by 2.0 ^ EV |
 
 Nodes appear under:
 
@@ -144,6 +150,18 @@ Recommended transform:
 This will automatically reverse the color space before writing the final `.exr` file.
 
 The output is written to your selected output directory or ComfyUI's `output` folder as a 16-bit or 32-bit float EXR.
+
+### Nodex HDR Workflow (Synthetic HDR)
+
+If you are generating standard `[0,1]` AI images (e.g., FLUX or SDXL) and want true High Dynamic Range lighting for post-processing or 3D environment maps:
+
+```text
+AI Generator -> Synthetic HDR Expansion 🚀 -> Nodex HDR Viewer 🎨 -> Save EXR
+```
+
+1. Route your SDR image into **Synthetic HDR Expansion 🚀** to mathematically reconstruct lost highlights without multi-prompt ghosting.
+2. Plug the output into the **Nodex HDR Viewer 🎨** to visually inspect the true dynamic range. Try dropping the EV slider or enabling **False Color** to see the reconstructed highlight data roll off naturally instead of clamping to flat gray!
+3. Save the result as a 32-bit `.exr` using **Save EXR**.
 
 ### Verified Round-trip Workflow
 
