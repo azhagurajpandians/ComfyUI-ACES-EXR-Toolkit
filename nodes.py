@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import uuid
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
@@ -715,12 +716,147 @@ class ACESSaveEXR:
         return {"ui": {"text": [last_path]}, "result": (last_path,)}
 
 
+class NodexSyntheticHDRExpansion:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "boost_multiplier": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "threshold": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("image",)
+    FUNCTION      = "expand"
+    CATEGORY      = "image/ACES + EXR"
+
+    def expand(self, image: torch.Tensor, boost_multiplier: float, threshold: float) -> tuple:
+        arr = image.detach().cpu().numpy()
+        arr = np.nan_to_num(arr, nan=0.0, posinf=4.0, neginf=0.0)
+        rgb = np.clip(arr[..., :3], 0.0, 1.0)
+        linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4).astype(np.float32)
+        lum = (0.2126 * linear[..., 0] + 0.7152 * linear[..., 1] + 0.0722 * linear[..., 2])[..., None]
+        boost = np.where(lum > threshold, 1.0 + (lum - threshold) * boost_multiplier, 1.0).astype(np.float32)
+        hdr_linear = (linear * boost).astype(np.float32)
+        out = arr.copy()
+        out[..., :3] = hdr_linear
+        return (torch.from_numpy(out),)
+
+class NodexHDRExposureAdjust:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "ev_adjust": ("FLOAT", {"default": 0.0, "min": -20.0, "max": 20.0, "step": 0.1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "adjust"
+    CATEGORY = "image/ACES + EXR"
+
+    def adjust(self, image: torch.Tensor, ev_adjust: float):
+        multiplier = 2.0 ** ev_adjust
+        out = image.clone()
+        out[..., :3] = out[..., :3] * multiplier
+        return (out,)
+
+class NodexExposureBracketMerge:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "ev_values": ("STRING", {"default": "-2.0, 0.0, 2.0", "multiline": False, "tooltip": "Comma-separated EV values, e.g. -2.0, 0.0, 2.0"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("hdr_image",)
+    FUNCTION = "merge"
+    CATEGORY = "image/ACES + EXR"
+
+    def merge(self, images: torch.Tensor, ev_values: str):
+        import cv2
+        import numpy as np
+
+        arr = images.detach().cpu().numpy()
+        B = arr.shape[0]
+        evs = [float(e.strip()) for e in ev_values.split(",") if e.strip()]
+        if len(evs) != B:
+            raise ValueError(f"Number of EV values ({len(evs)}) must match number of images in batch ({B}).")
+
+        times = np.array([2.0 ** ev for ev in evs], dtype=np.float32)
+        arr_clipped = np.clip(arr, 0.0, 1.0)
+        arr_uint8 = (arr_clipped * 255.0).astype(np.uint8)
+        img_list = [arr_uint8[i, ..., :3] for i in range(B)]
+
+        merge_debevec = cv2.createMergeDebevec()
+        hdr = merge_debevec.process(img_list, times=times)
+
+        out = np.ones((1, hdr.shape[0], hdr.shape[1], arr.shape[3] if arr.shape[3] == 4 else 3), dtype=np.float32)
+        out[0, ..., :3] = hdr
+        if arr.shape[3] == 4:
+            out[0, ..., 3] = arr[0, ..., 3] 
+        return (torch.from_numpy(out),)
+
+class VispyEXRViewer:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"image": ("IMAGE",),},
+            "optional": {"exr_path": ("STRING", {"default": "", "tooltip": "Override: load EXR directly from disk"}),},
+        }
+
+    RETURN_TYPES  = ("IMAGE", "STRING")
+    RETURN_NAMES  = ("image", "exr_path")
+    FUNCTION      = "view"
+    CATEGORY      = "image/ACES + EXR"
+    OUTPUT_NODE   = True
+
+    def view(self, image: torch.Tensor, exr_path: str = "") -> tuple:
+        temp_dir = folder_paths.get_temp_directory()
+        filename = f"nodex_hdr_{uuid.uuid4().hex[:8]}.bin"
+        filepath = os.path.join(temp_dir, filename)
+        
+        if exr_path.strip() and os.path.exists(exr_path.strip()):
+            from .exr_utils import load_exr
+            arr = load_exr(exr_path.strip())
+            h, w = arr.shape[:2]
+            c = arr.shape[2] if arr.ndim == 3 else 1
+            if c == 1:
+                arr = np.stack([arr]*3 + [np.ones_like(arr)], -1)
+            elif c == 3:
+                arr = np.concatenate([arr, np.ones((*arr.shape[:2], 1), np.float32)], -1)
+            with open(filepath, "wb") as f:
+                f.write(arr.astype(np.float32).tobytes())
+            return {"ui": {"hdr_data": [{"filename": filename, "width": w, "height": h}]}, "result": (image, exr_path)}
+        else:
+            arr = image[0].cpu().numpy().astype(np.float32)
+            h, w = arr.shape[:2]
+            c = arr.shape[2] if arr.ndim == 3 else 1
+            if c == 1:
+                arr = np.stack([arr]*3 + [np.ones_like(arr)], -1)
+            elif c == 3:
+                arr = np.concatenate([arr, np.ones((*arr.shape[:2], 1), np.float32)], -1)
+            with open(filepath, "wb") as f:
+                f.write(arr.astype(np.float32).tobytes())
+            return {"ui": {"hdr_data": [{"filename": filename, "width": w, "height": h}]}, "result": (image, exr_path)}
+
 NODE_CLASS_MAPPINGS = {
     "ACESLoadEXR": ACESLoadEXR,
     "ACESLoadEXRFromPath": ACESLoadEXRFromPath,
     "ACESTransform": ACESTransform,
     "ACESToneMap": ACESToneMap,
     "ACESSaveEXR": ACESSaveEXR,
+    "VispyEXRViewer": VispyEXRViewer,
+    "NodexSyntheticHDRExpansion": NodexSyntheticHDRExpansion,
+    "NodexExposureBracketMerge": NodexExposureBracketMerge,
+    "NodexHDRExposureAdjust": NodexHDRExposureAdjust,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -729,4 +865,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ACESTransform": "ACES Color Transform",
     "ACESToneMap": "ACES Tone Map",
     "ACESSaveEXR": "Save EXR",
+    "VispyEXRViewer": "Nodex HDR Viewer 🎨",
+    "NodexSyntheticHDRExpansion": "Synthetic HDR Expansion 🚀",
+    "NodexExposureBracketMerge": "Exposure Bracket Merge 📸",
+    "NodexHDRExposureAdjust": "HDR Exposure Adjust 💡",
 }
