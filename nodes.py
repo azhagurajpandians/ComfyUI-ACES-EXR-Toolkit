@@ -765,6 +765,36 @@ class NodexHDRExposureAdjust:
         out[..., :3] = out[..., :3] * multiplier
         return (out,)
 
+class NodexAutoBracketGenerator:
+    """
+    Automatically generates a batch of exposure brackets from a single SDR image by mathematically multiplying the RGB values.
+    Note: This does not hallucinate lost highlight details, it simply fakes the exposure steps.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "ev_values": ("STRING", {"default": "-2.0, 0.0, 2.0", "multiline": False, "tooltip": "Comma-separated EV values"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("bracket_batch",)
+    FUNCTION = "generate"
+    CATEGORY = "image/ACES + EXR"
+
+    def generate(self, image: torch.Tensor, ev_values: str):
+        evs = [float(e.strip()) for e in ev_values.split(",") if e.strip()]
+        out_images = []
+        for ev in evs:
+            multiplier = 2.0 ** ev
+            # Math bracket and clip to 1.0 to simulate standard camera sensor
+            img_bracket = torch.clamp(image * multiplier, 0.0, 1.0)
+            out_images.append(img_bracket)
+        
+        return (torch.cat(out_images, dim=0),)
+
 class NodexExposureBracketMerge:
     @classmethod
     def INPUT_TYPES(cls):
@@ -917,6 +947,7 @@ NODE_CLASS_MAPPINGS = {
     "NodexSyntheticHDRExpansion": NodexSyntheticHDRExpansion,
     "NodexExposureBracketMerge": NodexExposureBracketMerge,
     "NodexHDRExposureAdjust": NodexHDRExposureAdjust,
+    "NodexAutoBracketGenerator": NodexAutoBracketGenerator,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -929,4 +960,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NodexSyntheticHDRExpansion": "Synthetic HDR Expansion 🚀",
     "NodexExposureBracketMerge": "Exposure Bracket Merge 📸",
     "NodexHDRExposureAdjust": "HDR Exposure Adjust 💡",
+    "NodexAutoBracketGenerator": "Auto Bracket Generator 🎞️",
 }
