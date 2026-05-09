@@ -770,10 +770,16 @@ class NodexExposureBracketMerge:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
+                "image1": ("IMAGE",),
                 "ev_values": ("STRING", {"default": "-2.0, 0.0, 2.0", "multiline": False, "tooltip": "Comma-separated EV values, e.g. -2.0, 0.0, 2.0"}),
                 "adaptive_calibration": ("BOOLEAN", {"default": True, "tooltip": "Analyze actual brightness relationships instead of assuming perfect camera physics"}),
             },
+            "optional": {
+                "image2": ("IMAGE",),
+                "image3": ("IMAGE",),
+                "image4": ("IMAGE",),
+                "image5": ("IMAGE",),
+            }
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -781,9 +787,20 @@ class NodexExposureBracketMerge:
     FUNCTION = "merge"
     CATEGORY = "image/ACES + EXR"
 
-    def merge(self, images: torch.Tensor, ev_values: str, adaptive_calibration: bool = True):
+    def merge(self, image1: torch.Tensor, ev_values: str, adaptive_calibration: bool = True, image2=None, image3=None, image4=None, image5=None):
         import cv2
         import numpy as np
+
+        images_list = [image1]
+        if image2 is not None: images_list.append(image2)
+        if image3 is not None: images_list.append(image3)
+        if image4 is not None: images_list.append(image4)
+        if image5 is not None: images_list.append(image5)
+        
+        try:
+            images = torch.cat(images_list, dim=0)
+        except Exception as e:
+            raise ValueError(f"Failed to batch images. Ensure all connected images have the same dimensions. Error: {e}")
 
         arr = images.detach().cpu().numpy()
         B = arr.shape[0]
