@@ -15,6 +15,10 @@ void main() {
 const FRAG_SHADER = `
 precision highp float;
 uniform sampler2D u_texture;
+uniform sampler2D u_textureB;
+uniform bool u_use_b;
+uniform float u_split_pos;
+
 uniform float u_exposure;
 uniform float u_gamma;
 uniform int u_channel; // 0=RGB, 1=R, 2=G, 3=B, 4=A, 5=Luma
@@ -28,6 +32,9 @@ float srgb(float v) {
 
 void main() {
     vec4 c = texture2D(u_texture, v_texcoord);
+    if (u_use_b && v_texcoord.x > u_split_pos) {
+        c = texture2D(u_textureB, v_texcoord);
+    }
     vec3 rgb = c.rgb * pow(2.0, u_exposure);
 
     if (u_channel == 1) rgb = vec3(rgb.r);
@@ -59,6 +66,10 @@ void main() {
         }
     }
 
+    if (u_use_b && abs(v_texcoord.x - u_split_pos) < 0.002) {
+        gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0); // Split line
+        return;
+    }
     gl_FragColor = vec4(rgb, 1.0);
 }
 `;
@@ -185,6 +196,18 @@ app.registerExtension({
                         fcBtn.style.borderRadius = "3px";
                         fcBtn.style.cursor = "pointer";
                         let fcOn = false;
+
+                        // A/B Toggle Button
+                        const abBtn = document.createElement("button");
+                        abBtn.innerText = "A/B Split";
+                        abBtn.style.background = "#333";
+                        abBtn.style.color = "#ccc";
+                        abBtn.style.border = "1px solid #444";
+                        abBtn.style.padding = "2px 6px";
+                        abBtn.style.borderRadius = "3px";
+                        abBtn.style.cursor = "pointer";
+                        abBtn.style.display = "none"; // Hide until B is loaded
+                        let abOn = false;
                         
                         // Channel Select
                         const chSelect = document.createElement("select");
@@ -216,6 +239,7 @@ app.registerExtension({
                         controlsDiv.appendChild(resetBtn);
                         controlsDiv.appendChild(srgbBtn);
                         controlsDiv.appendChild(fcBtn);
+                        controlsDiv.appendChild(abBtn);
                         controlsDiv.appendChild(chSelect);
                         
                         container.appendChild(controlsDiv);
@@ -231,12 +255,27 @@ app.registerExtension({
                         domWidget.srgbOn = srgbOn;
                         domWidget.fcBtn = fcBtn;
                         domWidget.fcOn = fcOn;
+                        domWidget.abBtn = abBtn;
+                        domWidget.abOn = abOn;
+                        domWidget.splitPos = 0.5;
                         domWidget.chSelect = chSelect;
                         domWidget.imgWidth = 1;
                         domWidget.imgHeight = 1;
                         
-                        // Prevent dragging canvas from moving node
-                        canvas.onmousedown = (e) => e.stopPropagation();
+                        // Prevent dragging canvas from moving node, enable split sliding
+                        let isDraggingSplit = false;
+                        canvas.onmousedown = (e) => {
+                            e.stopPropagation();
+                            if (domWidget.abOn) isDraggingSplit = true;
+                        };
+                        canvas.onmousemove = (e) => {
+                            if (isDraggingSplit && domWidget.abOn) {
+                                const rect = canvas.getBoundingClientRect();
+                                domWidget.splitPos = Math.max(0.0, Math.min(1.0, (e.clientX - rect.left) / rect.width));
+                                render();
+                            }
+                        };
+                        window.addEventListener("mouseup", () => isDraggingSplit = false);
                         controlsDiv.onmousedown = (e) => e.stopPropagation();
                         
                         // WebGL Init
@@ -265,10 +304,18 @@ app.registerExtension({
                         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
                         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
                         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+                        const texB = gl.createTexture();
+                        gl.bindTexture(gl.TEXTURE_2D, texB);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
                         
                         domWidget.gl = gl;
                         domWidget.prog = prog;
                         domWidget.tex = tex;
+                        domWidget.texB = texB;
                         
                         // Setup render loop triggers
                         const render = () => {
@@ -304,9 +351,18 @@ app.registerExtension({
                             gl.uniform1i(gl.getUniformLocation(prog, "u_channel"), parseInt(chSelect.value));
                             gl.uniform1i(gl.getUniformLocation(prog, "u_false_color"), domWidget.fcOn ? 1 : 0);
                             
+                            gl.uniform1i(gl.getUniformLocation(prog, "u_use_b"), domWidget.abOn ? 1 : 0);
+                            gl.uniform1f(gl.getUniformLocation(prog, "u_split_pos"), domWidget.splitPos);
+                            
                             gl.activeTexture(gl.TEXTURE0);
-                            gl.bindTexture(gl.TEXTURE_2D, tex);
+                            gl.bindTexture(gl.TEXTURE_2D, domWidget.tex);
                             gl.uniform1i(gl.getUniformLocation(prog, "u_texture"), 0);
+
+                            if (domWidget.hasTexB) {
+                                gl.activeTexture(gl.TEXTURE1);
+                                gl.bindTexture(gl.TEXTURE_2D, domWidget.texB);
+                                gl.uniform1i(gl.getUniformLocation(prog, "u_textureB"), 1);
+                            }
                             
                             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
                         };
@@ -336,6 +392,14 @@ app.registerExtension({
                             fcBtn.style.color = domWidget.fcOn ? "#fff" : "#ccc";
                             render();
                         };
+
+                        abBtn.onclick = () => {
+                            domWidget.abOn = !domWidget.abOn;
+                            abBtn.style.background = domWidget.abOn ? "#2080e8" : "#333";
+                            abBtn.style.color = domWidget.abOn ? "#fff" : "#ccc";
+                            render();
+                        };
+
                         chSelect.onchange = render;
                         
                         domWidget.render = render;
@@ -369,6 +433,27 @@ app.registerExtension({
                         }
                         
                         gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, data.width, data.height, 0, gl.RGBA, gl.FLOAT, f32);
+
+                        // Load Texture B if it exists
+                        if (message.hdr_data.length > 1) {
+                            const dataB = message.hdr_data[1];
+                            const urlB = `/nodex_hdr/view?filename=${dataB.filename}`;
+                            const resB = await fetch(urlB);
+                            const bufferB = await resB.arrayBuffer();
+                            const f32B = new Float32Array(bufferB);
+                            
+                            gl.bindTexture(gl.TEXTURE_2D, domWidget.texB);
+                            gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, dataB.width, dataB.height, 0, gl.RGBA, gl.FLOAT, f32B);
+                            domWidget.hasTexB = true;
+                            domWidget.abBtn.style.display = "block";
+                            if (!domWidget.abOn) {
+                                domWidget.abBtn.click(); // Auto enable A/B if B is connected
+                            }
+                        } else {
+                            domWidget.hasTexB = false;
+                            domWidget.abBtn.style.display = "none";
+                            domWidget.abOn = false;
+                        }
                         
                         domWidget.render();
                         

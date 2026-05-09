@@ -772,6 +772,7 @@ class NodexExposureBracketMerge:
             "required": {
                 "images": ("IMAGE",),
                 "ev_values": ("STRING", {"default": "-2.0, 0.0, 2.0", "multiline": False, "tooltip": "Comma-separated EV values, e.g. -2.0, 0.0, 2.0"}),
+                "adaptive_calibration": ("BOOLEAN", {"default": True, "tooltip": "Analyze actual brightness relationships instead of assuming perfect camera physics"}),
             },
         }
 
@@ -780,7 +781,7 @@ class NodexExposureBracketMerge:
     FUNCTION = "merge"
     CATEGORY = "image/ACES + EXR"
 
-    def merge(self, images: torch.Tensor, ev_values: str):
+    def merge(self, images: torch.Tensor, ev_values: str, adaptive_calibration: bool = True):
         import cv2
         import numpy as np
 
@@ -792,6 +793,32 @@ class NodexExposureBracketMerge:
 
         times = np.array([2.0 ** ev for ev in evs], dtype=np.float32)
         arr_clipped = np.clip(arr, 0.0, 1.0)
+        
+        if adaptive_calibration and B > 1:
+            try:
+                ref_idx = min(range(len(evs)), key=lambda i: abs(evs[i]))
+                ref_img = arr_clipped[ref_idx, ..., :3]
+                ref_luma = 0.2126 * ref_img[..., 0] + 0.7152 * ref_img[..., 1] + 0.0722 * ref_img[..., 2]
+                
+                mask = (ref_luma > 0.2) & (ref_luma < 0.8)
+                if np.sum(mask) > 1000:
+                    new_times = []
+                    for i in range(B):
+                        if i == ref_idx:
+                            new_times.append(times[i])
+                            continue
+                        tgt_img = arr_clipped[i, ..., :3]
+                        tgt_luma = 0.2126 * tgt_img[..., 0] + 0.7152 * tgt_img[..., 1] + 0.0722 * tgt_img[..., 2]
+                        ratios = tgt_luma[mask] / (ref_luma[mask] + 1e-6)
+                        median_ratio = np.median(ratios)
+                        time_ratio = median_ratio ** 1.8
+                        calibrated_time = times[ref_idx] * time_ratio
+                        new_times.append(calibrated_time)
+                    times = np.array(new_times, dtype=np.float32)
+                    print(f"[Nodex HDR] Adaptive Calibration Times: {times}")
+            except Exception as e:
+                print(f"[Nodex HDR] Adaptive Calibration failed, using nominal times: {e}")
+
         arr_uint8 = (arr_clipped * 255.0).astype(np.uint8)
         img_list = [arr_uint8[i, ..., :3] for i in range(B)]
 
@@ -809,7 +836,10 @@ class VispyEXRViewer:
     def INPUT_TYPES(cls):
         return {
             "required": {"image": ("IMAGE",),},
-            "optional": {"exr_path": ("STRING", {"default": "", "tooltip": "Override: load EXR directly from disk"}),},
+            "optional": {
+                "image_b": ("IMAGE",),
+                "exr_path": ("STRING", {"default": "", "tooltip": "Override: load EXR directly from disk"}),
+            },
         }
 
     RETURN_TYPES  = ("IMAGE", "STRING")
@@ -818,13 +848,27 @@ class VispyEXRViewer:
     CATEGORY      = "image/ACES + EXR"
     OUTPUT_NODE   = True
 
-    def view(self, image: torch.Tensor, exr_path: str = "") -> tuple:
+    def view(self, image: torch.Tensor, image_b=None, exr_path: str = "") -> tuple:
         temp_dir = folder_paths.get_temp_directory()
-        filename = f"nodex_hdr_{uuid.uuid4().hex[:8]}.bin"
-        filepath = os.path.join(temp_dir, filename)
         
+        def save_tensor_to_bin(tensor):
+            filename = f"nodex_hdr_{uuid.uuid4().hex[:8]}.bin"
+            filepath = os.path.join(temp_dir, filename)
+            arr = tensor[0].cpu().numpy().astype(np.float32)
+            h, w = arr.shape[:2]
+            c = arr.shape[2] if arr.ndim == 3 else 1
+            if c == 1:
+                arr = np.stack([arr]*3 + [np.ones_like(arr)], -1)
+            elif c == 3:
+                arr = np.concatenate([arr, np.ones((*arr.shape[:2], 1), np.float32)], -1)
+            with open(filepath, "wb") as f:
+                f.write(arr.astype(np.float32).tobytes())
+            return filename, w, h
+
         if exr_path.strip() and os.path.exists(exr_path.strip()):
             from .exr_utils import load_exr
+            filename = f"nodex_hdr_{uuid.uuid4().hex[:8]}.bin"
+            filepath = os.path.join(temp_dir, filename)
             arr = load_exr(exr_path.strip())
             h, w = arr.shape[:2]
             c = arr.shape[2] if arr.ndim == 3 else 1
@@ -834,18 +878,17 @@ class VispyEXRViewer:
                 arr = np.concatenate([arr, np.ones((*arr.shape[:2], 1), np.float32)], -1)
             with open(filepath, "wb") as f:
                 f.write(arr.astype(np.float32).tobytes())
-            return {"ui": {"hdr_data": [{"filename": filename, "width": w, "height": h}]}, "result": (image, exr_path)}
+            hdr_data = [{"filename": filename, "width": w, "height": h}]
+            return {"ui": {"hdr_data": hdr_data}, "result": (image, exr_path)}
         else:
-            arr = image[0].cpu().numpy().astype(np.float32)
-            h, w = arr.shape[:2]
-            c = arr.shape[2] if arr.ndim == 3 else 1
-            if c == 1:
-                arr = np.stack([arr]*3 + [np.ones_like(arr)], -1)
-            elif c == 3:
-                arr = np.concatenate([arr, np.ones((*arr.shape[:2], 1), np.float32)], -1)
-            with open(filepath, "wb") as f:
-                f.write(arr.astype(np.float32).tobytes())
-            return {"ui": {"hdr_data": [{"filename": filename, "width": w, "height": h}]}, "result": (image, exr_path)}
+            filename, w, h = save_tensor_to_bin(image)
+            hdr_data = [{"filename": filename, "width": w, "height": h}]
+            
+            if image_b is not None:
+                filename_b, w_b, h_b = save_tensor_to_bin(image_b)
+                hdr_data.append({"filename": filename_b, "width": w_b, "height": h_b})
+                
+            return {"ui": {"hdr_data": hdr_data}, "result": (image, exr_path)}
 
 NODE_CLASS_MAPPINGS = {
     "ACESLoadEXR": ACESLoadEXR,
