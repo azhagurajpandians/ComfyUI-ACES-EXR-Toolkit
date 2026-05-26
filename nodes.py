@@ -532,7 +532,7 @@ class ACESLoadEXR:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "exr_file": (_list_input_exrs(), {"image_upload": True}),
+                "exr_file": (_list_input_exrs(),),
                 "alpha_mode": (["composite checker", "ignore", "unpremultiply", "premultiply", "composite black", "composite gray", "composite white"],),
                 "clamp_negative": (["false", "true"],),
                 "frame_mode": (["all", "single", "range"], {"default": "all"}),
