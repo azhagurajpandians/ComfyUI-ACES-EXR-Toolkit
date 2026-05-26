@@ -4,24 +4,30 @@ import numpy as np
 def load_exr(filepath):
     """
     Load an EXR file into a numpy float32 array.
-    Attempts to use imageio (with freeimage), then OpenEXR, then tifffile.
+    Attempts to use OpenCV (cv2), then OpenEXR, then tifffile.
     Returns array of shape (H, W, 3) or (H, W, 4).
     """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"File not found: {filepath}")
 
-    # 1. Try imageio with freeimage plugin
+    errors = []
+
+    # 1. Try OpenCV (cv2) - standard in ComfyUI environment and extremely fast/robust
     try:
-        import imageio.v3 as iio
-        # using the freeimage format usually gives proper 32-bit floats
-        arr = iio.imread(filepath, plugin="FI")
-        if arr is not None and arr.dtype in (np.float32, np.float16, np.float64):
+        import cv2
+        # cv2.IMREAD_UNCHANGED preserves float32/float16 precision and alpha channels
+        arr = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+        if arr is not None:
+            # OpenCV loads as BGR or BGRA, convert to RGB or RGBA
+            if arr.ndim == 3:
+                channels = arr.shape[2]
+                if channels == 3:
+                    arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                elif channels == 4:
+                    arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGBA)
             return arr.astype(np.float32)
-        elif arr is not None:
-             # Just in case it reads it as something else but didn't throw
-             return arr.astype(np.float32)
     except Exception as e:
-        pass
+        errors.append(f"OpenCV: {e}")
 
     # 2. Try OpenEXR
     try:
@@ -49,7 +55,7 @@ def load_exr(filepath):
                 arr = np.stack([chan_data['R'], chan_data['G'], chan_data['B']], axis=-1)
             return arr
     except Exception as e:
-        pass
+        errors.append(f"OpenEXR: {e}")
 
     # 3. Try tifffile (can sometimes handle simple EXRs, mostly TIFFs)
     try:
@@ -57,17 +63,6 @@ def load_exr(filepath):
         arr = tifffile.imread(filepath)
         return arr.astype(np.float32)
     except Exception as e:
-        pass
+        errors.append(f"tifffile: {e}")
 
-    # 4. Try standard imageio (might return 8-bit or 16-bit int if no plugins)
-    try:
-        import imageio.v3 as iio
-        arr = iio.imread(filepath)
-        # Normalize to 0-1 if it's integer type
-        if arr.dtype == np.uint8:
-            arr = arr.astype(np.float32) / 255.0
-        elif arr.dtype == np.uint16:
-            arr = arr.astype(np.float32) / 65535.0
-        return arr.astype(np.float32)
-    except Exception as e:
-        raise RuntimeError(f"Could not load EXR file {filepath}. Please install imageio[freeimage] or OpenEXR.")
+    raise RuntimeError(f"Could not load EXR file {filepath}. Errors: " + " | ".join(errors))

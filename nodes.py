@@ -192,29 +192,41 @@ def _read_exr(path: Path) -> np.ndarray:
         errors.append(f"opencv: {exc}")
 
     try:
-        import imageio.v2 as iio
-        import imageio
-        try:
-            imageio.plugins.freeimage.download()
-        except Exception:
-            pass
-        return iio.imread(path, format="EXR-FI")
+        import OpenEXR
+        import Imath
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        exr_file = OpenEXR.InputFile(str(path))
+        header = exr_file.header()
+        dw = header['dataWindow']
+        size = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
+        
+        channels = header['channels'].keys()
+        chan_data = {}
+        
+        if 'R' in channels and 'G' in channels and 'B' in channels:
+            for c in ['R', 'G', 'B']:
+                chan_str = exr_file.channel(c, pt)
+                chan_data[c] = np.frombuffer(chan_str, dtype=np.float32).reshape(size[1], size[0])
+            
+            if 'A' in channels:
+                chan_str = exr_file.channel('A', pt)
+                chan_data['A'] = np.frombuffer(chan_str, dtype=np.float32).reshape(size[1], size[0])
+                arr = np.stack([chan_data['R'], chan_data['G'], chan_data['B'], chan_data['A']], axis=-1)
+            else:
+                arr = np.stack([chan_data['R'], chan_data['G'], chan_data['B']], axis=-1)
+            return arr
     except Exception as exc:
-        errors.append(f"imageio(freeimage): {exc}")
+        errors.append(f"OpenEXR: {exc}")
 
     try:
-        import imageio.v3 as iio
-        img = iio.imread(path)
-        if img.dtype == np.uint8:
-            print("Warning: ComfyUI-ACES-EXR read EXR as 8-bit, values normalized and precision lost.")
-            img = img.astype(np.float32) / 255.0
-        return img
+        import tifffile
+        img = tifffile.imread(str(path))
+        return img.astype(np.float32)
     except Exception as exc:
-        errors.append(f"imageio(v3): {exc}")
+        errors.append(f"tifffile: {exc}")
 
     raise RuntimeError(
-        "Could not read EXR. Install an EXR-capable backend such as OpenImageIO, "
-        "or enable OpenEXR support for imageio/opencv. Backend errors: " + " | ".join(errors)
+        "Could not read EXR. Backend errors: " + " | ".join(errors)
     )
 
 def _detect_exr_sequence(path_str):
@@ -351,12 +363,12 @@ def _write_exr(path: Path, image: np.ndarray, bit_depth: str = "32f (float)", co
         errors.append(f"opencv: {exc}")
 
     try:
-        import imageio.v3 as iio
+        import tifffile
 
-        iio.imwrite(path, image.astype(np.float32))
+        tifffile.imwrite(str(path), image.astype(np.float32))
         return
     except Exception as exc:
-        errors.append(f"imageio: {exc}")
+        errors.append(f"tifffile: {exc}")
 
     raise RuntimeError("Could not write EXR. Backend errors: " + " | ".join(errors))
 
