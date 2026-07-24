@@ -607,9 +607,10 @@ class ACESLoadEXRFromPath:
         if not path.exists():
             raise FileNotFoundError(f"EXR file not found: {path}")
 
-        # Security: confine reads to ComfyUI input and output directories only
-        allowed = [_input_dir(), _output_dir()]
-        _assert_path_allowed(path, allowed, action="read")
+        # ACESLoadEXRFromPath is explicitly designed for VFX/render-farm workflows
+        # where EXR sequences live on any drive or network path.
+        # Data is returned as a tensor into ComfyUI's pipeline only — not served over HTTP.
+        # Extension (.exr) is enforced below by _load_exr_sequence.
 
         seq_arr, count, f_start, f_end = _load_exr_sequence(str(path), frame_mode, start_frame, end_frame, missing_frames)
         
