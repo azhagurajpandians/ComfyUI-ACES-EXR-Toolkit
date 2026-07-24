@@ -97,6 +97,28 @@ def _output_dir() -> str:
     return folder_paths.get_output_directory()
 
 
+def _assert_path_allowed(path: Path, allowed_dirs: list, action: str = "access") -> None:
+    """Raise PermissionError if *path* is not contained inside one of *allowed_dirs*.
+
+    Uses os.path.realpath to resolve symlinks / '..' components before comparing,
+    so traversal attacks such as '../../../etc/passwd' are blocked.
+    """
+    real = os.path.realpath(str(path))
+    for allowed in allowed_dirs:
+        real_allowed = os.path.realpath(str(allowed))
+        try:
+            if os.path.commonpath([real, real_allowed]) == real_allowed:
+                return  # contained — OK
+        except ValueError:
+            # commonpath raises ValueError on Windows when paths have different drives
+            pass
+    allowed_strs = ", ".join(str(d) for d in allowed_dirs)
+    raise PermissionError(
+        f"Security: refusing to {action} '{path}'. "
+        f"Path must be inside one of the allowed directories: {allowed_strs}"
+    )
+
+
 def _list_input_exrs():
     root = Path(_input_dir())
     if not root.exists():
@@ -584,7 +606,11 @@ class ACESLoadEXRFromPath:
         path = Path(exr_path.strip())
         if not path.exists():
             raise FileNotFoundError(f"EXR file not found: {path}")
-            
+
+        # Security: confine reads to ComfyUI input and output directories only
+        allowed = [_input_dir(), _output_dir()]
+        _assert_path_allowed(path, allowed, action="read")
+
         seq_arr, count, f_start, f_end = _load_exr_sequence(str(path), frame_mode, start_frame, end_frame, missing_frames)
         
         if clamp_negative == "true":
@@ -708,7 +734,15 @@ class ACESSaveEXR:
         
         if ocio_config and ocio_config.strip():
             arr = _apply_ocio(arr, ocio_config, input_transform, colorspace)
-            
+
+        # Security: resolve the output directory and ensure it stays inside the
+        # ComfyUI output directory (blocks absolute paths and '../..' traversal).
+        resolved_output_dir = Path(os.path.realpath(output_dir.strip()))
+        _assert_path_allowed(resolved_output_dir, [_output_dir()], action="write to")
+
+        # Create the directory only after the containment check passes.
+        resolved_output_dir.mkdir(parents=True, exist_ok=True)
+
         B = arr.shape[0]
         last_path = ""
         for b in range(B):
@@ -716,10 +750,12 @@ class ACESSaveEXR:
             base_name = re.sub(r"%0(\d+)d", lambda m: f"{frame_num:0{m.group(1)}d}", filename)
             if not base_name.lower().endswith(".exr"):
                 base_name += ".exr"
-            path = Path(output_dir.strip()) / base_name
+            # Strip any directory separators from the filename to prevent traversal
+            base_name = os.path.basename(base_name)
+            path = resolved_output_dir / base_name
             
             # Simple indexing fallback if no format string was used and multiple frames
-            if B > 1 and base_name == filename + ".exr":
+            if B > 1 and base_name == os.path.basename(filename) + ".exr":
                 path = path.with_name(f"{path.stem}_{frame_num:04d}.exr")
             
             _write_exr(path, arr[b], bit_depth, compression)
@@ -926,6 +962,14 @@ class VispyEXRViewer:
 
         if exr_path.strip() and os.path.exists(exr_path.strip()):
             from .exr_utils import load_exr
+
+            # Security: confine exr_path reads to ComfyUI input/output dirs only
+            _assert_path_allowed(
+                Path(exr_path.strip()),
+                [_input_dir(), _output_dir()],
+                action="read"
+            )
+
             filename = f"nodex_hdr_{uuid.uuid4().hex[:8]}.bin"
             filepath = os.path.join(temp_dir, filename)
             arr = load_exr(exr_path.strip())
