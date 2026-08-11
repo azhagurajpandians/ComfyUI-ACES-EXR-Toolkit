@@ -4,30 +4,19 @@ import numpy as np
 def load_exr(filepath):
     """
     Load an EXR file into a numpy float32 array.
-    Attempts to use OpenCV (cv2), then OpenEXR, then tifffile.
+    Attempts to use OpenEXR (Python library), then tifffile as fallback.
+
+    Note: cv2.imread is intentionally skipped for EXR files because the
+    OpenCV build shipped with ComfyUI has its EXR codec disabled
+    (OPENCV_IO_ENABLE_OPENEXR is not set), which produces noisy warnings
+    and always falls back anyway.
+
     Returns array of shape (H, W, 3) or (H, W, 4).
     """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"File not found: {filepath}")
 
     errors = []
-
-    # 1. Try OpenCV (cv2) - standard in ComfyUI environment and extremely fast/robust
-    try:
-        import cv2
-        # cv2.IMREAD_UNCHANGED preserves float32/float16 precision and alpha channels
-        arr = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
-        if arr is not None:
-            # OpenCV loads as BGR or BGRA, convert to RGB or RGBA
-            if arr.ndim == 3:
-                channels = arr.shape[2]
-                if channels == 3:
-                    arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-                elif channels == 4:
-                    arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGBA)
-            return arr.astype(np.float32)
-    except Exception as e:
-        errors.append(f"OpenCV: {e}")
 
     # 2. Try OpenEXR
     try:

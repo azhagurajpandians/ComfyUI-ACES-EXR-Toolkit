@@ -97,6 +97,32 @@ def _output_dir() -> str:
     return folder_paths.get_output_directory()
 
 
+def _temp_dir() -> str:
+    if folder_paths is None:
+        return os.getcwd()
+    return folder_paths.get_temp_directory()
+
+
+def _get_all_allowed_dirs() -> list:
+    """Return all permitted directories: input, output, temp, plus all directories
+    configured in ComfyUI (e.g., via extra_model_paths.yaml)."""
+    dirs = []
+    for d in [_input_dir(), _output_dir(), _temp_dir()]:
+        if d and d not in dirs:
+            dirs.append(d)
+    if folder_paths is not None and hasattr(folder_paths, "folder_names_and_paths"):
+        for name, entry in folder_paths.folder_names_and_paths.items():
+            if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                paths = entry[0]
+                if isinstance(paths, (list, tuple, set)):
+                    for p in paths:
+                        if p and p not in dirs:
+                            dirs.append(p)
+                elif isinstance(paths, (str, Path)) and paths not in dirs:
+                    dirs.append(str(paths))
+    return dirs
+
+
 def _assert_path_allowed(path: Path, allowed_dirs: list, action: str = "access") -> None:
     """Raise PermissionError if *path* is not contained inside one of *allowed_dirs*.
 
@@ -112,11 +138,34 @@ def _assert_path_allowed(path: Path, allowed_dirs: list, action: str = "access")
         except ValueError:
             # commonpath raises ValueError on Windows when paths have different drives
             pass
-    allowed_strs = ", ".join(str(d) for d in allowed_dirs)
+    allowed_strs = "\n  - " + "\n  - ".join(str(d) for d in allowed_dirs)
     raise PermissionError(
-        f"Security: refusing to {action} '{path}'. "
-        f"Path must be inside one of the allowed directories: {allowed_strs}"
+        f"Security: refusing to {action} '{path}'.\n"
+        f"Path must be inside one of the allowed directories:{allowed_strs}\n"
+        f"To allow additional directories (e.g. render folders or external drives), add them to extra_model_paths.yaml in ComfyUI."
     )
+
+
+def _assert_exr_read_allowed(path: Path) -> None:
+    """Confines reads to ComfyUI allowed directories (input/output/temp/configured extra paths).
+    For external render drives, allows valid .exr or .hdr files while blocking non-EXR system file reads.
+    """
+    allowed = _get_all_allowed_dirs()
+    real = os.path.realpath(str(path))
+    for allowed_dir in allowed:
+        real_allowed = os.path.realpath(str(allowed_dir))
+        try:
+            if os.path.commonpath([real, real_allowed]) == real_allowed:
+                return  # contained in ComfyUI allowed dirs — OK
+        except ValueError:
+            pass
+
+    # For external drives: strictly require .exr or .hdr file extension
+    ext = path.suffix.lower()
+    if ext in (".exr", ".hdr") and path.exists():
+        return  # valid EXR file — OK
+
+    _assert_path_allowed(path, allowed, action="read")
 
 
 def _list_input_exrs():
@@ -333,7 +382,84 @@ def _load_exr_sequence(path_str, frame_mode, start_frame, end_frame, missing_pol
     return seq_arr, len(frames), f_start, f_end
 
 
-def _write_exr_openexr(img: np.ndarray, path: str, use_half: bool, compression_key: str):
+def _read_exr_all_layers(path: Path):
+    """Reads all channels from an EXR file and groups them into layers.
+    Returns: (dict_of_layer_arrays, list_of_layer_names)
+    """
+    try:
+        import OpenEXR
+        import Imath
+        exr_file = OpenEXR.InputFile(str(path))
+        header = exr_file.header()
+        dw = header['dataWindow']
+        W, H = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+
+        channels = list(header['channels'].keys())
+        chan_data = {}
+        for c in channels:
+            chan_str = exr_file.channel(c, pt)
+            chan_data[c] = np.frombuffer(chan_str, dtype=np.float32).reshape(H, W)
+
+        # Group channels by layer prefix
+        groups = {}
+        for c in channels:
+            if '.' in c:
+                prefix, sub = c.split('.', 1)
+            else:
+                prefix, sub = 'beauty', c
+            if prefix not in groups:
+                groups[prefix] = {}
+            groups[prefix][sub] = chan_data[c]
+
+        layers = {}
+        for layer_name, ch_dict in groups.items():
+            if all(k in ch_dict for k in ['R', 'G', 'B']):
+                ch_list = [ch_dict['R'], ch_dict['G'], ch_dict['B']]
+                if 'A' in ch_dict:
+                    ch_list.append(ch_dict['A'])
+                layers[layer_name] = np.stack(ch_list, axis=-1)
+            elif all(k in ch_dict for k in ['X', 'Y', 'Z']):
+                layers[layer_name] = np.stack([ch_dict['X'], ch_dict['Y'], ch_dict['Z']], axis=-1)
+            elif 'Z' in ch_dict:
+                layers[layer_name] = ch_dict['Z'][:, :, None]
+            elif 'A' in ch_dict and len(ch_dict) == 1:
+                layers[layer_name] = ch_dict['A'][:, :, None]
+            else:
+                sorted_keys = sorted(ch_dict.keys())
+                layers[layer_name] = np.stack([ch_dict[k] for k in sorted_keys], axis=-1)
+
+        return layers, list(layers.keys())
+    except Exception:
+        arr = _read_exr(path)
+        return {"beauty": arr}, ["beauty"]
+
+
+def _read_exr_header_info(path: Path):
+    """Returns (meta_dict, width, height, channel_list, compression_name)"""
+    try:
+        import OpenEXR
+        exr_file = OpenEXR.InputFile(str(path))
+        header = exr_file.header()
+        dw = header['dataWindow']
+        W, H = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
+        channels = list(header['channels'].keys())
+        comp = str(header.get('compression', 'unknown'))
+
+        meta = {}
+        for k, v in header.items():
+            if k not in ['channels', 'dataWindow', 'displayWindow']:
+                meta[str(k)] = str(v)
+        return meta, W, H, channels, comp
+    except Exception:
+        arr = _read_exr(path)
+        H, W = arr.shape[:2]
+        C = arr.shape[2] if arr.ndim == 3 else 1
+        chans = ["R", "G", "B", "A"][:C]
+        return {"backend": "opencv"}, W, H, chans, "Unknown"
+
+
+def _write_exr_openexr_multilayer(channels_dict: dict, path: str, use_half: bool, compression_key: str):
     import OpenEXR
     import Imath
     
@@ -342,38 +468,122 @@ def _write_exr_openexr(img: np.ndarray, path: str, use_half: bool, compression_k
     ptype_write = Imath.PixelType(Imath.PixelType.HALF if use_half else Imath.PixelType.FLOAT)
     dtype_write = np.float16 if use_half else np.float32
 
-    H, W, C = img.shape
-    channel_names = ["R", "G", "B", "A"] if C == 4 else ["R", "G", "B"]
+    first_arr = next(iter(channels_dict.values()))
+    H, W = first_arr.shape[:2]
 
     header = OpenEXR.Header(W, H)
     header["compression"] = Imath.Compression(imath_comp)
-    header["channels"] = {ch: Imath.Channel(ptype_write) for ch in channel_names}
+    header["channels"] = {ch: Imath.Channel(ptype_write) for ch in channels_dict.keys()}
 
     out = OpenEXR.OutputFile(path, header)
     pixels = {}
-    for i, ch in enumerate(channel_names):
-        pixels[ch] = img[:, :, i].astype(dtype_write).tobytes()
+    for ch, arr in channels_dict.items():
+        if arr.ndim == 3:
+            arr = arr[:, :, 0]
+        pixels[ch] = arr.astype(dtype_write).tobytes()
     out.writePixels(pixels)
     out.close()
 
 
-def _write_exr(path: Path, image: np.ndarray, bit_depth: str = "32f (float)", compression: str = "None (uncompressed)"):
+def _resize_pass_to_target(pass_arr: np.ndarray, target_H: int, target_W: int) -> np.ndarray:
+    """Resize pass_arr [pH, pW, C] or [pH, pW] to match target [target_H, target_W, C]."""
+    pH, pW = pass_arr.shape[:2]
+    if pH == target_H and pW == target_W:
+        return pass_arr
+    try:
+        import cv2
+        return cv2.resize(pass_arr, (target_W, target_H), interpolation=cv2.INTER_LINEAR)
+    except Exception:
+        p_tensor = torch.from_numpy(pass_arr)
+        if p_tensor.ndim == 2:
+            p_tensor = p_tensor[None, None, :, :]
+        elif p_tensor.ndim == 3:
+            p_tensor = p_tensor.permute(2, 0, 1)[None, :, :, :]
+        res = torch.nn.functional.interpolate(p_tensor, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        res_np = res[0].permute(1, 2, 0).cpu().numpy()
+        return res_np if pass_arr.ndim == 3 else res_np[:, :, 0]
+
+
+def _write_exr(
+    path: Path,
+    image: np.ndarray,
+    bit_depth: str = "32f (float)",
+    compression: str = "None (uncompressed)",
+    extra_passes: dict = None
+):
     errors = []
     path.parent.mkdir(parents=True, exist_ok=True)
-    
     use_half = "16f" in bit_depth
-    
+
+    # Standard beauty channels
+    H, W = image.shape[:2]
+    C = image.shape[2] if image.ndim == 3 else 1
+    channels_dict = {}
+
+    if C == 4:
+        channels_dict["R"] = image[:, :, 0]
+        channels_dict["G"] = image[:, :, 1]
+        channels_dict["B"] = image[:, :, 2]
+        channels_dict["A"] = image[:, :, 3]
+    elif C == 3:
+        channels_dict["R"] = image[:, :, 0]
+        channels_dict["G"] = image[:, :, 1]
+        channels_dict["B"] = image[:, :, 2]
+    else:
+        channels_dict["R"] = image[:, :, 0] if image.ndim == 3 else image
+        channels_dict["G"] = channels_dict["R"]
+        channels_dict["B"] = channels_dict["R"]
+
+    if extra_passes:
+        for layer_name, pass_arr in extra_passes.items():
+            if pass_arr is None:
+                continue
+            if pass_arr.ndim == 2:
+                pass_arr = pass_arr[:, :, None]
+
+            # Automatically resize pass array to match beauty pass (H, W) if dimensions differ
+            pH, pW = pass_arr.shape[:2]
+            if pH != H or pW != W:
+                pass_arr = _resize_pass_to_target(pass_arr, H, W)
+                if pass_arr.ndim == 2:
+                    pass_arr = pass_arr[:, :, None]
+
+            p_C = pass_arr.shape[2]
+            if layer_name in ["depth", "Z"]:
+                # Depth pass: store strictly as 1-channel depth.Z
+                if p_C >= 3:
+                    luma = 0.2126 * pass_arr[:, :, 0] + 0.7152 * pass_arr[:, :, 1] + 0.0722 * pass_arr[:, :, 2]
+                    channels_dict["depth.Z"] = luma.astype(np.float32)
+                else:
+                    channels_dict["depth.Z"] = pass_arr[:, :, 0]
+            elif layer_name == "mask":
+                # Mask pass: store strictly as 1-channel mask.A
+                channels_dict["mask.A"] = pass_arr[:, :, 0]
+            elif layer_name == "normal":
+                # Normal pass: store as normal.X, normal.Y, normal.Z
+                sub_chans = ["X", "Y", "Z"] if p_C >= 3 else ["X"]
+                for i, sc in enumerate(sub_chans):
+                    channels_dict[f"normal.{sc}"] = pass_arr[:, :, i]
+            else:
+                # Custom passes (diffuse, specular, emission, etc.)
+                if p_C == 1:
+                    channels_dict[f"{layer_name}.A"] = pass_arr[:, :, 0]
+                elif p_C >= 3:
+                    sub_chans = ["R", "G", "B", "A"][:p_C]
+                    for i, sc in enumerate(sub_chans):
+                        channels_dict[f"{layer_name}.{sc}"] = pass_arr[:, :, i]
+
     try:
-        _write_exr_openexr(image, str(path), use_half, compression)
+        _write_exr_openexr_multilayer(channels_dict, str(path), use_half, compression)
         return
     except ImportError:
         errors.append("OpenEXR python module not installed (pip install openexr)")
     except Exception as exc:
+        print(f"[ACESSaveEXR Error] OpenEXR write failed: {exc}")
         errors.append(f"OpenEXR: {exc}")
 
     try:
         import cv2
-
         out = image
         if out.ndim == 3 and out.shape[-1] >= 3:
             order = [2, 1, 0] + list(range(3, out.shape[-1]))
@@ -386,7 +596,6 @@ def _write_exr(path: Path, image: np.ndarray, bit_depth: str = "32f (float)", co
 
     try:
         import tifffile
-
         tifffile.imwrite(str(path), image.astype(np.float32))
         return
     except Exception as exc:
@@ -561,6 +770,9 @@ class ACESLoadEXR:
                 "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
                 "end_frame": ("INT", {"default": 100, "min": 0, "max": 99999}),
                 "missing_frames": (["error", "black", "hold"], {"default": "error"}),
+            },
+            "optional": {
+                "exr_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Optional path override"}),
             }
         }
 
@@ -569,11 +781,13 @@ class ACESLoadEXR:
     FUNCTION = "load"
     CATEGORY = CATEGORY
 
-    def load(self, exr_file, alpha_mode, clamp_negative, frame_mode, start_frame, end_frame, missing_frames):
-        path = _resolve_input_path(exr_file, "")
+    def load(self, exr_file, alpha_mode, clamp_negative, frame_mode, start_frame, end_frame, missing_frames, exr_path=""):
+        path = _resolve_input_path(exr_file, exr_path)
         if not path.exists():
             raise FileNotFoundError(f"EXR file not found: {path}")
-            
+
+        _assert_exr_read_allowed(path)
+
         seq_arr, count, f_start, f_end = _load_exr_sequence(str(path), frame_mode, start_frame, end_frame, missing_frames)
         
         if clamp_negative == "true":
@@ -581,6 +795,7 @@ class ACESLoadEXR:
             
         tensor, mask = _image_to_tensor(seq_arr, alpha_mode)
         return (tensor, mask, count, f_start, f_end, str(path))
+
 
 class ACESLoadEXRFromPath:
     @classmethod
@@ -604,13 +819,12 @@ class ACESLoadEXRFromPath:
 
     def load(self, exr_path, alpha_mode, clamp_negative, frame_mode, start_frame, end_frame, missing_frames):
         path = Path(exr_path.strip())
+        if not path.is_absolute():
+            path = Path(_input_dir()) / path
         if not path.exists():
             raise FileNotFoundError(f"EXR file not found: {path}")
 
-        # ACESLoadEXRFromPath is explicitly designed for VFX/render-farm workflows
-        # where EXR sequences live on any drive or network path.
-        # Data is returned as a tensor into ComfyUI's pipeline only — not served over HTTP.
-        # Extension (.exr) is enforced below by _load_exr_sequence.
+        _assert_exr_read_allowed(path)
 
         seq_arr, count, f_start, f_end = _load_exr_sequence(str(path), frame_mode, start_frame, end_frame, missing_frames)
         
@@ -619,9 +833,6 @@ class ACESLoadEXRFromPath:
             
         tensor, mask = _image_to_tensor(seq_arr, alpha_mode)
         return (tensor, mask, count, f_start, f_end, str(path))
-
-
-
 
 
 class ACESTransform:
@@ -679,7 +890,7 @@ class ACESToneMap:
             "required": {
                 "image": ("IMAGE",),
                 "exposure": ("FLOAT", {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.05}),
-                "look": (["ACES fitted", "Reinhard"],),
+                "look": (["ACES fitted", "Reinhard", "AgX", "Filmic (Blender)", "DaVinci"],),
                 "output": (["sRGB", "Linear sRGB"],),
             }
         }
@@ -691,11 +902,23 @@ class ACESToneMap:
     def tonemap(self, image, exposure, look, output):
         arr = _tensor_to_numpy(image).copy()
         rgb = np.maximum(arr[..., :3] * (2.0 ** exposure), 0.0)
+        
         if look == "ACES fitted":
             a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
             rgb = (rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e)
-        else:
+        elif look == "Reinhard":
             rgb = rgb / (1.0 + rgb)
+        elif look == "AgX":
+            min_ev, max_ev = -10.0, +6.5
+            log_rgb = np.clip((np.log2(np.maximum(rgb, 1e-6)) - min_ev) / (max_ev - min_ev), 0.0, 1.0)
+            rgb = log_rgb * log_rgb * (3.0 - 2.0 * log_rgb)
+        elif look == "Filmic (Blender)":
+            x = np.maximum(0.0, rgb - 0.004)
+            rgb = (x * (6.2 * x + 0.5)) / (x * (6.2 * x + 1.7) + 0.06)
+        elif look == "DaVinci":
+            rgb = np.where(rgb > 0.008, 0.5 * np.log2(rgb + 0.008) + 0.5, rgb * 60.0)
+            rgb = np.clip(rgb, 0.0, 1.0)
+
         rgb = np.clip(rgb, 0.0, 1.0)
         if output == "sRGB":
             rgb = _srgb_encode(rgb)
@@ -715,10 +938,13 @@ class ACESSaveEXR:
                 "compression": (COMPRESSION_KEYS, {"default": COMPRESSION_KEYS[0]}),
             },
             "optional": {
+                "depth": ("IMAGE,MASK",),
+                "normal": ("IMAGE",),
+                "mask": ("MASK",),
+                "diffuse": ("IMAGE",),
+                "specular": ("IMAGE",),
+                "emission": ("IMAGE",),
                 "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
-                "ocio_config": ("STRING", {"default": DEFAULT_OCIO_CONFIG, "multiline": False}),
-                "input_transform": (OCIO_SPACES, {"default": "ACEScg"}),
-                "colorspace": (OCIO_SPACES, {"default": "ACES2065-1"}),
             }
         }
 
@@ -729,40 +955,128 @@ class ACESSaveEXR:
     CATEGORY = CATEGORY
 
     def save(self, image, output_dir, filename, bit_depth, compression,
-             start_frame=1, ocio_config=DEFAULT_OCIO_CONFIG, input_transform="ACEScg", colorspace="ACES2065-1"):
+             depth=None, normal=None, mask=None, diffuse=None, specular=None, emission=None, start_frame=1):
         import re
         arr = _tensor_to_numpy(image).copy()
-        
-        if ocio_config and ocio_config.strip():
-            arr = _apply_ocio(arr, ocio_config, input_transform, colorspace)
 
-        # Security: resolve the output directory and ensure it stays inside the
-        # ComfyUI output directory (blocks absolute paths and '../..' traversal).
         resolved_output_dir = Path(os.path.realpath(output_dir.strip()))
         _assert_path_allowed(resolved_output_dir, [_output_dir()], action="write to")
-
-        # Create the directory only after the containment check passes.
         resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
         B = arr.shape[0]
         last_path = ""
+
+        def extract_pass(tensor, batch_idx):
+            if tensor is None:
+                return None
+            np_p = tensor.detach().cpu().numpy()
+            if np_p.ndim == 2:
+                return np_p
+            if np_p.ndim == 3:
+                if np_p.shape[0] == B:
+                    return np_p[batch_idx]
+                return np_p
+            if np_p.ndim == 4:
+                b_i = min(batch_idx, np_p.shape[0] - 1)
+                return np_p[b_i]
+            return np_p
+
         for b in range(B):
             frame_num = start_frame + b
             base_name = re.sub(r"%0(\d+)d", lambda m: f"{frame_num:0{m.group(1)}d}", filename)
             if not base_name.lower().endswith(".exr"):
                 base_name += ".exr"
-            # Strip any directory separators from the filename to prevent traversal
             base_name = os.path.basename(base_name)
             path = resolved_output_dir / base_name
             
-            # Simple indexing fallback if no format string was used and multiple frames
             if B > 1 and base_name == os.path.basename(filename) + ".exr":
                 path = path.with_name(f"{path.stem}_{frame_num:04d}.exr")
-            
-            _write_exr(path, arr[b], bit_depth, compression)
+
+            extra_passes = {
+                "depth": extract_pass(depth, b),
+                "normal": extract_pass(normal, b),
+                "mask": extract_pass(mask, b),
+                "diffuse": extract_pass(diffuse, b),
+                "specular": extract_pass(specular, b),
+                "emission": extract_pass(emission, b),
+            }
+            extra_passes = {k: v for k, v in extra_passes.items() if v is not None}
+
+            _write_exr(path, arr[b], bit_depth, compression, extra_passes=extra_passes)
             last_path = str(path)
             
         return {"ui": {"text": [last_path]}, "result": (last_path,)}
+
+
+class EXRLayerLoad:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "exr_path": ("STRING", {"default": "", "multiline": False}),
+                "layer_name": ("STRING", {"default": "beauty", "multiline": False, "placeholder": "e.g. beauty, depth, normal, mask"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "available_layers")
+    FUNCTION = "load_layer"
+    CATEGORY = CATEGORY
+
+    def load_layer(self, exr_path, layer_name="beauty"):
+        path = Path(exr_path.strip())
+        if not path.is_absolute():
+            path = Path(_input_dir()) / path
+        if not path.exists():
+            raise FileNotFoundError(f"EXR file not found: {path}")
+
+        _assert_exr_read_allowed(path)
+
+        layers, available = _read_exr_all_layers(path)
+        
+        target = layer_name.strip()
+        if target not in layers:
+            if "beauty" in layers:
+                target = "beauty"
+            elif layers:
+                target = list(layers.keys())[0]
+            else:
+                raise ValueError(f"No valid layers found in EXR: {path}")
+
+        img_arr = layers[target]
+        tensor, mask = _image_to_tensor(img_arr, "ignore")
+        avail_str = ", ".join(available)
+        return (tensor, mask, avail_str)
+
+
+class EXRMetadata:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "exr_path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("metadata_json", "width", "height", "channels", "compression")
+    FUNCTION = "read_metadata"
+    CATEGORY = CATEGORY
+
+    def read_metadata(self, exr_path):
+        import json
+        path = Path(exr_path.strip())
+        if not path.is_absolute():
+            path = Path(_input_dir()) / path
+        if not path.exists():
+            raise FileNotFoundError(f"EXR file not found: {path}")
+
+        _assert_exr_read_allowed(path)
+
+        meta, W, H, channels, comp = _read_exr_header_info(path)
+        meta_str = json.dumps(meta, indent=2)
+        chan_str = ", ".join(channels)
+        return (meta_str, W, H, chan_str, comp)
 
 
 class NodexSyntheticHDRExpansion:
@@ -838,7 +1152,6 @@ class NodexAutoBracketGenerator:
         out_images = []
         for ev in evs:
             multiplier = 2.0 ** ev
-            # Math bracket and clip to 1.0 to simulate standard camera sensor
             img_bracket = torch.clamp(image * multiplier, 0.0, 1.0)
             out_images.append(img_bracket)
         
@@ -946,28 +1259,38 @@ class VispyEXRViewer:
 
     def view(self, image: torch.Tensor, image_b=None, exr_path: str = "") -> tuple:
         temp_dir = folder_paths.get_temp_directory()
-        
-        def save_tensor_to_bin(tensor):
-            filename = f"nodex_hdr_{uuid.uuid4().hex[:8]}.bin"
-            filepath = os.path.join(temp_dir, filename)
-            arr = tensor[0].cpu().numpy().astype(np.float32)
-            h, w = arr.shape[:2]
-            c = arr.shape[2] if arr.ndim == 3 else 1
-            if c == 1:
-                arr = np.stack([arr]*3 + [np.ones_like(arr)], -1)
-            elif c == 3:
-                arr = np.concatenate([arr, np.ones((*arr.shape[:2], 1), np.float32)], -1)
-            with open(filepath, "wb") as f:
-                f.write(arr.astype(np.float32).tobytes())
-            return filename, w, h
+
+        def save_sequence(tensor: torch.Tensor):
+            """Save every frame of a [N, H, W, C] batch tensor to separate .bin files.
+
+            Returns a list of dicts: [{filename, width, height}, ...]
+            Each .bin file is a raw float32 RGBA buffer (H*W*4 floats).
+            """
+            frames = []
+            for i in range(tensor.shape[0]):
+                filename = f"nodex_hdr_{uuid.uuid4().hex[:8]}.bin"
+                filepath = os.path.join(temp_dir, filename)
+                arr = tensor[i].cpu().numpy().astype(np.float32)
+                h, w = arr.shape[:2]
+                c = arr.shape[2] if arr.ndim == 3 else 1
+                if c == 1:
+                    arr = np.stack([arr] * 3 + [np.ones_like(arr)], axis=-1)
+                elif c == 3:
+                    arr = np.concatenate(
+                        [arr, np.ones((*arr.shape[:2], 1), np.float32)], axis=-1
+                    )
+                with open(filepath, "wb") as f:
+                    f.write(arr.astype(np.float32).tobytes())
+                frames.append({"filename": filename, "width": int(w), "height": int(h)})
+            return frames
 
         if exr_path.strip() and os.path.exists(exr_path.strip()):
             from .exr_utils import load_exr
 
-            # Security: confine exr_path reads to ComfyUI input/output dirs only
+            # Security: confine exr_path reads to ComfyUI allowed dirs
             _assert_path_allowed(
                 Path(exr_path.strip()),
-                [_input_dir(), _output_dir()],
+                _get_all_allowed_dirs(),
                 action="read"
             )
 
@@ -977,22 +1300,21 @@ class VispyEXRViewer:
             h, w = arr.shape[:2]
             c = arr.shape[2] if arr.ndim == 3 else 1
             if c == 1:
-                arr = np.stack([arr]*3 + [np.ones_like(arr)], -1)
+                arr = np.stack([arr] * 3 + [np.ones_like(arr)], axis=-1)
             elif c == 3:
-                arr = np.concatenate([arr, np.ones((*arr.shape[:2], 1), np.float32)], -1)
+                arr = np.concatenate(
+                    [arr, np.ones((*arr.shape[:2], 1), np.float32)], axis=-1
+                )
             with open(filepath, "wb") as f:
                 f.write(arr.astype(np.float32).tobytes())
-            hdr_data = [{"filename": filename, "width": w, "height": h}]
-            return {"ui": {"hdr_data": hdr_data}, "result": (image, exr_path)}
+            sequence_a = [{"filename": filename, "width": int(w), "height": int(h)}]
+            return {"ui": {"sequence_a": sequence_a}, "result": (image, exr_path)}
         else:
-            filename, w, h = save_tensor_to_bin(image)
-            hdr_data = [{"filename": filename, "width": w, "height": h}]
-            
+            sequence_a = save_sequence(image)
+            ui_data = {"sequence_a": sequence_a}
             if image_b is not None:
-                filename_b, w_b, h_b = save_tensor_to_bin(image_b)
-                hdr_data.append({"filename": filename_b, "width": w_b, "height": h_b})
-                
-            return {"ui": {"hdr_data": hdr_data}, "result": (image, exr_path)}
+                ui_data["sequence_b"] = save_sequence(image_b)
+            return {"ui": ui_data, "result": (image, exr_path)}
 
 NODE_CLASS_MAPPINGS = {
     "ACESLoadEXR": ACESLoadEXR,
@@ -1000,6 +1322,8 @@ NODE_CLASS_MAPPINGS = {
     "ACESTransform": ACESTransform,
     "ACESToneMap": ACESToneMap,
     "ACESSaveEXR": ACESSaveEXR,
+    "EXRLayerLoad": EXRLayerLoad,
+    "EXRMetadata": EXRMetadata,
     "VispyEXRViewer": VispyEXRViewer,
     "NodexSyntheticHDRExpansion": NodexSyntheticHDRExpansion,
     "NodexExposureBracketMerge": NodexExposureBracketMerge,
@@ -1012,7 +1336,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ACESLoadEXRFromPath": "Load EXR From Path",
     "ACESTransform": "ACES Color Transform",
     "ACESToneMap": "ACES Tone Map",
-    "ACESSaveEXR": "Save EXR",
+    "ACESSaveEXR": "Save EXR (Multi-Layer)",
+    "EXRLayerLoad": "Load EXR Layer",
+    "EXRMetadata": "EXR Metadata Reader",
     "VispyEXRViewer": "Nodex HDR Viewer 🎨",
     "NodexSyntheticHDRExpansion": "Synthetic HDR Expansion 🚀",
     "NodexExposureBracketMerge": "Exposure Bracket Merge 📸",

@@ -6,25 +6,27 @@ This extension adds practical OpenEXR loading/saving, ACES Studio 1.3 OCIO color
 
 ## Features
 
+- **Multi-Layer EXR Export**: Save multi-channel EXRs containing beauty, depth, normal, mask, diffuse, specular, and emission passes into a single file for Nuke/Resolve VFX workflows.
+- **EXR Layer & Metadata Inspection**: Extract named channels/layers from multi-layer EXRs, and read complete header metadata JSON.
+- **Advanced Tone Mapping**: Includes **AgX** (Blender standard), **Filmic**, **DaVinci**, ACES fitted, and Reinhard curves.
 - **Fast OCIO Processing**: Native bulk-pixel processing via PyOpenColorIO for lightning-fast ACES transformations.
 - **Load EXR Sequences**: Auto-detects and loads numbered EXR sequences (`render.0001.exr`) directly into ComfyUI batch tensors.
 - **16-bit & 32-bit Export**: Save half-float (16f) or float (32f) EXRs with standard compression codecs (ZIP, PIZ, DWAA) via `OpenEXR`.
-- **Integrated UI Browser**: Visual file browser modal to easily pick absolute paths and output directories without copy-pasting.
 - **HDR WebGL Viewer**: A GPU-accelerated viewer with real-time Exposure, Gamma, False Color (ARRI-style), and Channel isolation for true 32-bit float inspection inside ComfyUI.
 - **HDR Generation Tools**: Includes Synthetic Highlight Expansion to generate HDR from SDR AI outputs, and Exposure Bracket Merging.
-- **Alpha Previews**: Preview transparent EXRs with checker, black, gray, or white alpha compositing.
-- **Built-in Fallbacks**: Basic ACEScg / sRGB transforms work even if OCIO isn't installed.
-- **Tone Mapping**: Apply simple display tone mapping for HDR previews.
+- **Path Security Containment**: Full containment protecting against path traversal, while supporting custom render drives configured via `extra_model_paths.yaml`.
 
 ## Nodes
 
 | Node | Purpose |
 | --- | --- |
 | `Load EXR` | Load `.exr` files from ComfyUI `input`, with optional path override |
-| `Load EXR From Path` | Load an EXR from any absolute path |
+| `Load EXR From Path` | Load an EXR sequence from any allowed path or drive |
+| `Load EXR Layer` | Extract specific named layers (beauty, depth, normal, mask, etc.) from multi-layer EXRs |
+| `EXR Metadata Reader` | Inspect EXR header attributes, dimensions, channels, and compression |
 | `ACES Color Transform` | Transform between ACES, camera, sRGB, and utility color spaces |
-| `ACES Tone Map` | Apply simple display tone mapping for HDR previews |
-| `Save EXR` | Save ComfyUI image data as float EXR |
+| `ACES Tone Map` | Tone map HDR float tensors with **AgX**, **Filmic**, **DaVinci**, ACES fitted, or Reinhard curves |
+| `Save EXR (Multi-Layer)` | Save float EXRs with optional multi-layer passes (depth, normal, mask, diffuse, etc.) |
 | `Nodex HDR Viewer 🎨` | GPU-accelerated (WebGL) 32-bit float viewer with Exposure, Gamma, False Color, and sRGB toggles |
 | `Synthetic HDR Expansion 🚀` | Reconstructs a scene-linear HDR tensor from a standard display-referred (SDR) AI generation |
 | `Exposure Bracket Merge 📸` | Merges a batch of SDR images at varying EV values into a single 32-bit HDR tensor |
