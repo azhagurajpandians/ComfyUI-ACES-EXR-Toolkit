@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0
+
+- Added sequence playback transport bar to Nodex HDR WebGL Viewer (Play/Pause, scrub, step, FPS selector).
+- Added multi-layer EXR saving and layer-by-layer extraction nodes (`Save EXR (Multi-Layer)`, `Load EXR Layer`).
+- Added EXR metadata inspector node (`EXR Metadata Reader`).
+- Added tone mapping curves: AgX, Filmic, DaVinci, ACES fitted, and Reinhard.
+- Added Synthetic Highlight Expansion and Exposure Bracket Merging nodes.
+- Added pixel RGBA HUD on hover, luminance histogram, and bilinear filter toggle in HDR viewer.
+- Added Comfy Registry support (`[tool.comfy]`, `.comfyignore`, GitHub Actions workflow).
+- Fixed canvas sizing and layout scaling issues with LiteGraph node resizing and graph zoom.
+
 ## 0.1.0
 
 - Initial public release.
