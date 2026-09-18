@@ -12,5 +12,10 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/azhagurajpandians/ComfyUI-ACES-EXR-Toolkit"
 
+[tool.comfy]
+PublisherId = "azhagurajpandians"
+DisplayName = "ComfyUI ACES EXR Toolkit"
+Icon = ""
+
 [tool.ruff]
 line-length = 120
