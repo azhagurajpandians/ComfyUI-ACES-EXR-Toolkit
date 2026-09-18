@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Add official node pack icon for Comfy Registry.
+- Clean up license string format.
+
 ## 0.2.0
 
 - Added sequence playback transport bar to Nodex HDR WebGL Viewer (Play/Pause, scrub, step, FPS selector).
