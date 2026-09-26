@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Added automatic sequence start/end frame detection on sequence selection and path entry.
+- Added `⚡ Auto Detect Range` button to `Load EXR` and `Load EXR From Path`.
+- Added `first_frame` and `last_frame` output ports as `IMAGE` tensors.
+- Added `width` and `height` dimension output ports (`INT`).
+- Added `start_frame` and `end_frame` sequence index output ports (`INT`).
+- Added `/aces/sequence_info` backend API route for instant sequence querying.
+- Added backend auto-correction for default/out-of-bounds frame ranges to prevent missing frame errors.
+
 ## 0.2.1
 
 - Add official node pack icon for Comfy Registry.

@@ -266,15 +266,15 @@ app.registerExtension({
                 Object.assign(evVal.style, { fontSize: "11px", color: "#ccc", minWidth: "24px" });
 
                 // Gamma
-                const gLbl = document.createElement("span");
-                gLbl.innerText = "γ:";
-                Object.assign(gLbl.style, { color: "#666", fontSize: "11px" });
-                const gSlider = document.createElement("input");
-                Object.assign(gSlider, { type: "range", min: 0.1, max: 5.0, step: 0.1, value: 2.2 });
-                gSlider.style.width = "60px";
-                const gVal = document.createElement("span");
-                gVal.innerText = "2.2";
-                Object.assign(gVal.style, { fontSize: "11px", color: "#ccc", minWidth: "24px" });
+                                const gLbl = document.createElement("span");
+                                gLbl.innerText = "γ:";
+                                Object.assign(gLbl.style, { color: "#666", fontSize: "11px" });
+                                const gSlider = document.createElement("input");
+                                Object.assign(gSlider, { type: "range", min: 0.1, max: 5.0, step: 0.1, value: 1.0 });
+                                gSlider.style.width = "60px";
+                                const gVal = document.createElement("span");
+                                gVal.innerText = "1.0";
+                                Object.assign(gVal.style, { fontSize: "11px", color: "#ccc", minWidth: "24px" });
 
                 // Buttons
                 const resetBtn  = mkBtn("Reset",       "Reset EV, Gamma & Zoom  [R]");
@@ -707,11 +707,11 @@ app.registerExtension({
                     render();
                 };
                 resetBtn.onclick = () => {
-                    evSlider.value = "0";  evVal.innerText = "0.0";
-                    gSlider.value  = "2.2"; gVal.innerText = "2.2";
-                    dw.viewZoom = 1.0; dw.viewPanX = 0; dw.viewPanY = 0;
-                    render();
-                };
+                                    evSlider.value = "0";  evVal.innerText = "0.0";
+                                    gSlider.value  = "1.0"; gVal.innerText = "1.0";
+                                    dw.viewZoom = 1.0; dw.viewPanX = 0; dw.viewPanY = 0;
+                                    render();
+                                };
                 srgbBtn.onclick = () => {
                     dw.srgbOn = !dw.srgbOn;
                     setOn(srgbBtn, dw.srgbOn, "#e8a020", "#111");

@@ -178,7 +178,7 @@ def _list_input_exrs():
 
 def _resolve_input_path(filename: str, exr_path: str = "") -> Path:
     selected = (filename or "").strip()
-    typed = (exr_path or "").strip().strip('"')
+    typed = (exr_path or "").strip().strip('"').strip("'")
     value = typed or selected
     if not value or value.startswith("<"):
         raise FileNotFoundError(
@@ -189,11 +189,14 @@ def _resolve_input_path(filename: str, exr_path: str = "") -> Path:
     if not path.is_absolute():
         path = Path(_input_dir()) / path
     if path.is_dir():
+        exrs = sorted([p for p in path.glob("*.exr") if p.is_file()])
+        if exrs:
+            return exrs[0]
         raise IsADirectoryError(
             f"Expected an .exr file but got a folder: {path}. "
             "Select a specific .exr file or paste the full file path into exr_path."
         )
-    if path.suffix.lower() != ".exr":
+    if path.suffix.lower() != ".exr" and "%" not in path.name and "#" not in path.name:
         raise ValueError(f"Expected an .exr file, got: {path}")
     return path
 
@@ -302,8 +305,39 @@ def _read_exr(path: Path) -> np.ndarray:
 
 def _detect_exr_sequence(path_str):
     import re
-    path = Path(path_str)
+    raw_str = str(path_str).strip().strip('"').strip("'")
+    if not raw_str:
+        return [], 0, 0
+    path = Path(raw_str)
+    
+    if path.is_dir():
+        exr_files = [f for f in path.iterdir() if f.is_file() and f.suffix.lower() == ".exr"]
+        if not exr_files:
+            return [], 0, 0
+        exr_files.sort(key=lambda x: x.name)
+        path = exr_files[0]
+
     if not path.is_file():
+        # Check if it has pattern wildcards like %04d or ####
+        if "%" in path.name or "#" in path.name:
+            dir_path = path.parent
+            if dir_path.is_dir():
+                pattern = re.sub(r'%0?\d*d|#+', r'(\d+)', path.name)
+                pattern = f"^{pattern}$"
+                seq_files = []
+                try:
+                    entries = list(dir_path.iterdir())
+                except Exception:
+                    entries = []
+                for f in entries:
+                    if f.is_file():
+                        m = re.match(pattern, f.name, re.IGNORECASE)
+                        if m:
+                            seq_files.append((int(m.group(1)), f))
+                if seq_files:
+                    seq_files.sort(key=lambda x: x[0])
+                    paths = [f[1] for f in seq_files]
+                    return paths, seq_files[0][0], seq_files[-1][0]
         return [], 0, 0
     
     match = re.search(r'([._-]?)(0*\d+)(\.exr)$', path.name, re.IGNORECASE)
@@ -316,14 +350,26 @@ def _detect_exr_sequence(path_str):
     dir_path = path.parent
     seq_files = []
     
-    for f in dir_path.glob(f"*{suffix}"):
-        if f.name.startswith(prefix) and f.name.endswith(suffix):
-            num_str = f.name[len(prefix):-len(suffix)]
+    prefix_lower = prefix.lower()
+    suffix_lower = suffix.lower()
+    
+    try:
+        entries = list(dir_path.iterdir())
+    except Exception:
+        entries = []
+
+    for f in entries:
+        if not f.is_file():
+            continue
+        fname = f.name
+        if fname.lower().startswith(prefix_lower) and fname.lower().endswith(suffix_lower):
+            num_str = fname[len(prefix):len(fname)-len(suffix)]
             if num_str.isdigit():
                 seq_files.append((int(num_str), f))
                 
     if not seq_files:
-        return [path], 1, 1
+        val = int(match.group(2))
+        return [path], val, val
         
     seq_files.sort(key=lambda x: x[0])
     paths = [f[1] for f in seq_files]
@@ -342,10 +388,29 @@ def _load_exr_sequence(path_str, frame_mode, start_frame, end_frame, missing_pol
     path_map = {get_num(p): p for p in paths}
     
     if frame_mode == "single":
-        f_start = f_end = start_frame
+        if start_frame in path_map:
+            f_start = f_end = start_frame
+        else:
+            f_start = f_end = seq_first
     elif frame_mode == "range":
-        f_start, f_end = start_frame, end_frame
-    else: # all
+        f_start = seq_first if start_frame <= 0 else start_frame
+        f_end = seq_last if end_frame <= 0 else end_frame
+
+        # Auto-correct range when defaults or out-of-bounds are used
+        if f_start < seq_first and f_end < seq_first:
+            # Entire range is before sequence (e.g. default 1..100 on a sequence starting at 1001)
+            f_start, f_end = seq_first, seq_last
+        elif f_start > seq_last and f_end > seq_last:
+            # Entire range is after sequence
+            f_start, f_end = seq_first, seq_last
+        else:
+            if f_start < seq_first:
+                f_start = seq_first
+            if f_end > seq_last:
+                f_end = seq_last
+            if f_start > f_end:
+                f_start, f_end = seq_first, seq_last
+    else: # all / auto
         f_start, f_end = seq_first, seq_last
         
     frames = []
@@ -380,6 +445,7 @@ def _load_exr_sequence(path_str, frame_mode, start_frame, end_frame, missing_pol
             
     seq_arr = np.stack(frames, axis=0) # [B, H, W, C]
     return seq_arr, len(frames), f_start, f_end
+
 
 
 def _read_exr_all_layers(path: Path):
@@ -767,8 +833,8 @@ class ACESLoadEXR:
                 "alpha_mode": (["composite checker", "ignore", "unpremultiply", "premultiply", "composite black", "composite gray", "composite white"],),
                 "clamp_negative": (["false", "true"],),
                 "frame_mode": (["all", "single", "range"], {"default": "all"}),
-                "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
-                "end_frame": ("INT", {"default": 100, "min": 0, "max": 99999}),
+                "start_frame": ("INT", {"default": 1, "min": 0, "max": 999999}),
+                "end_frame": ("INT", {"default": 100, "min": 0, "max": 999999}),
                 "missing_frames": (["error", "black", "hold"], {"default": "error"}),
             },
             "optional": {
@@ -776,8 +842,8 @@ class ACESLoadEXR:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("image", "mask", "frame_count", "first_frame", "last_frame", "path")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "IMAGE", "INT", "INT", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("image", "mask", "first_frame", "last_frame", "width", "height", "frame_count", "start_frame", "end_frame", "path")
     FUNCTION = "load"
     CATEGORY = CATEGORY
 
@@ -794,7 +860,11 @@ class ACESLoadEXR:
             seq_arr = np.maximum(seq_arr, 0.0)
             
         tensor, mask = _image_to_tensor(seq_arr, alpha_mode)
-        return (tensor, mask, count, f_start, f_end, str(path))
+        height = int(tensor.shape[1])
+        width = int(tensor.shape[2])
+        first_frame = tensor[0:1]
+        last_frame = tensor[-1:]
+        return (tensor, mask, first_frame, last_frame, width, height, count, f_start, f_end, str(path))
 
 
 class ACESLoadEXRFromPath:
@@ -806,19 +876,19 @@ class ACESLoadEXRFromPath:
                 "alpha_mode": (["composite checker", "ignore", "unpremultiply", "premultiply", "composite black", "composite gray", "composite white"],),
                 "clamp_negative": (["false", "true"],),
                 "frame_mode": (["all", "single", "range"], {"default": "all"}),
-                "start_frame": ("INT", {"default": 1, "min": 0, "max": 99999}),
-                "end_frame": ("INT", {"default": 100, "min": 0, "max": 99999}),
+                "start_frame": ("INT", {"default": 1, "min": 0, "max": 999999}),
+                "end_frame": ("INT", {"default": 100, "min": 0, "max": 999999}),
                 "missing_frames": (["error", "black", "hold"], {"default": "error"}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("image", "mask", "frame_count", "first_frame", "last_frame", "path")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "IMAGE", "INT", "INT", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("image", "mask", "first_frame", "last_frame", "width", "height", "frame_count", "start_frame", "end_frame", "path")
     FUNCTION = "load"
     CATEGORY = CATEGORY
 
     def load(self, exr_path, alpha_mode, clamp_negative, frame_mode, start_frame, end_frame, missing_frames):
-        path = Path(exr_path.strip())
+        path = Path(exr_path.strip().strip('"').strip("'"))
         if not path.is_absolute():
             path = Path(_input_dir()) / path
         if not path.exists():
@@ -832,7 +902,11 @@ class ACESLoadEXRFromPath:
             seq_arr = np.maximum(seq_arr, 0.0)
             
         tensor, mask = _image_to_tensor(seq_arr, alpha_mode)
-        return (tensor, mask, count, f_start, f_end, str(path))
+        height = int(tensor.shape[1])
+        width = int(tensor.shape[2])
+        first_frame = tensor[0:1]
+        last_frame = tensor[-1:]
+        return (tensor, mask, first_frame, last_frame, width, height, count, f_start, f_end, str(path))
 
 
 class ACESTransform:

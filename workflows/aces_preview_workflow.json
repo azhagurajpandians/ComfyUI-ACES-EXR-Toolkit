@@ -14,6 +14,13 @@
       "outputs": [
         {"name": "image", "type": "IMAGE", "links": [1]},
         {"name": "mask", "type": "MASK", "links": null},
+        {"name": "first_frame", "type": "IMAGE", "links": null},
+        {"name": "last_frame", "type": "IMAGE", "links": null},
+        {"name": "width", "type": "INT", "links": null},
+        {"name": "height", "type": "INT", "links": null},
+        {"name": "frame_count", "type": "INT", "links": null},
+        {"name": "start_frame", "type": "INT", "links": null},
+        {"name": "end_frame", "type": "INT", "links": null},
         {"name": "path", "type": "STRING", "links": null}
       ],
       "properties": {"Node name for S&R": "ACESLoadEXRFromPath"},
